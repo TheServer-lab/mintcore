@@ -1,0 +1,1380 @@
+# ============================================================
+# MintCore — PyPI packaging scaffold
+# Restructures mintcore/ into a proper Python package
+# Run from OUTSIDE the mintcore/ folder:
+#   bytecraft mintcore_pypi.bc
+# ============================================================
+
+strict on
+
+set pkg     "mintcore"
+set version "1.0.0"
+set author  "Sourasish Das"
+set email   "you@example.com"
+set github  "https://github.com/yourusername/mintcore"
+
+print "Scaffolding MintCore PyPI package structure..."
+
+set-working-folder "{{pkg}}-pkg"
+
+# ── Top-level folders ─────────────────────────────────────────
+make-folder "src/mintcore"
+make-folder "src/mintcore/routers"
+make-folder "src/mintcore/bot"
+make-folder "src/mintcore/bot/cogs"
+make-folder "tests"
+make-folder "docs"
+
+# ============================================================
+# pyproject.toml  — single source of truth for packaging
+# ============================================================
+
+make-file "pyproject.toml" with ---
+[build-system]
+requires      = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name        = "mintcore"
+version     = "1.0.0"
+description = "Centralized virtual currency engine for game economies"
+readme      = "README.md"
+license     = { text = "SOCL-1.0" }
+requires-python = ">=3.10"
+
+authors = [
+  { name = "Sourasish Das", email = "{{email}}" },
+]
+
+keywords = [
+  "game economy", "virtual currency", "fastapi",
+  "currency engine", "mintcore",
+]
+
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: Other/Proprietary License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Games/Entertainment",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Framework :: FastAPI",
+]
+
+# Core dependencies — always installed
+dependencies = [
+  "fastapi>=0.110.0",
+  "uvicorn[standard]>=0.29.0",
+  "sqlalchemy>=2.0.0",
+  "pydantic>=2.0.0",
+  "httpx>=0.27.0",
+  "rich>=13.0.0",
+  "typer>=0.12.0",
+  "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+# pip install mintcore[bot]
+bot = [
+  "discord.py>=2.3.0",
+]
+# pip install mintcore[dev]
+dev = [
+  "pytest>=8.0.0",
+  "pytest-asyncio>=0.23.0",
+  "httpx>=0.27.0",
+  "hatch>=1.9.0",
+  "twine>=5.0.0",
+]
+
+[project.urls]
+Homepage      = "{{github}}"
+Documentation = "{{github}}#readme"
+Repository    = "{{github}}.git"
+Issues        = "{{github}}/issues"
+
+# CLI entrypoint — installs `mintcore` command
+[project.scripts]
+mintcore = "mintcore.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mintcore"]
+
+[tool.pytest.ini_options]
+testpaths       = ["tests"]
+asyncio_mode    = "auto"
+---
+
+# ============================================================
+# src/mintcore/__init__.py
+# Public API — what `import mintcore` exposes
+# ============================================================
+
+make-file "src/mintcore/__init__.py" with ---
+"""
+MintCore — Centralized virtual currency engine.
+
+Quick start:
+    from mintcore import MintCore
+    engine = MintCore()          # SQLite in current dir
+    engine.run()                 # starts FastAPI on :8000
+
+Programmatic use:
+    from mintcore.api import mint, transfer, get_balance
+"""
+
+from mintcore.engine import MintCore
+
+__version__ = "1.0.0"
+__all__     = ["MintCore"]
+---
+
+# ============================================================
+# src/mintcore/engine.py
+# The MintCore class — importable entry point for lib users
+# ============================================================
+
+make-file "src/mintcore/engine.py" with ---
+"""
+MintCore engine class.
+Wraps FastAPI app creation + uvicorn launch into a simple interface
+so library consumers never need to touch uvicorn directly.
+"""
+from __future__ import annotations
+
+import uvicorn
+from mintcore.app import create_app
+
+
+class MintCore:
+    """
+    Programmatic interface to the MintCore currency engine.
+
+    Example::
+
+        from mintcore import MintCore
+
+        engine = MintCore(
+            database_url="sqlite:///./game.db",
+            admin_key="super-secret",
+            debt_cap=-500,
+        )
+        engine.run(host="0.0.0.0", port=8000)
+    """
+
+    def __init__(
+        self,
+        database_url: str  = "sqlite:///./mintcore.db",
+        admin_key: str     = "admin-secret",
+        treasury_id: str   = "treasury",
+        interest_rate: int = 5,
+        debt_cap: int      = -1000,
+        cache_ttl: int     = 300,
+    ):
+        from mintcore import config as _cfg
+
+        # Override module-level config with constructor values
+        _cfg.DATABASE_URL  = database_url
+        _cfg.ADMIN_KEY     = admin_key
+        _cfg.TREASURY_ID   = treasury_id
+        _cfg.INTEREST_RATE = interest_rate
+        _cfg.DEBT_CAP      = debt_cap
+        _cfg.CACHE_TTL     = cache_ttl
+
+        self._app = create_app()
+
+    @property
+    def app(self):
+        """Return the raw FastAPI app (for ASGI mounting, testing, etc.)."""
+        return self._app
+
+    def run(self, host: str = "127.0.0.1", port: int = 8000, **kwargs):
+        """Start the uvicorn server (blocking)."""
+        uvicorn.run(self._app, host=host, port=port, **kwargs)
+---
+
+# ============================================================
+# src/mintcore/app.py
+# FastAPI app factory — separated from engine.py so tests
+# can call create_app() without starting uvicorn
+# ============================================================
+
+make-file "src/mintcore/app.py" with ---
+from fastapi import FastAPI
+from mintcore.database import Base, engine, SessionLocal
+from mintcore.models import User
+from mintcore import config
+from mintcore.routers import users, transactions, admin, rates, analytics
+
+
+def create_app() -> FastAPI:
+    app = FastAPI(
+        title="MintCore",
+        description="Centralized virtual currency engine",
+        version="1.0.0",
+    )
+
+    # Create tables
+    Base.metadata.create_all(bind=engine)
+
+    # Seed treasury account
+    with SessionLocal() as db:
+        if not db.query(User).filter_by(user_id=config.TREASURY_ID).first():
+            db.add(User(user_id=config.TREASURY_ID))
+            db.commit()
+
+    app.include_router(users.router)
+    app.include_router(transactions.router)
+    app.include_router(admin.router)
+    app.include_router(rates.router)
+    app.include_router(analytics.router)
+
+    @app.get("/", tags=["root"])
+    def root():
+        return {"engine": "MintCore", "version": "1.0.0", "docs": "/docs"}
+
+    return app
+---
+
+# ============================================================
+# src/mintcore/config.py
+# ============================================================
+
+make-file "src/mintcore/config.py" with ---
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+ADMIN_KEY     = os.getenv("MINTCORE_ADMIN_KEY",  "admin-secret")
+TREASURY_ID   = os.getenv("MINTCORE_TREASURY",   "treasury")
+DATABASE_URL  = os.getenv("MINTCORE_DB_URL",     "sqlite:///./mintcore.db")
+INTEREST_RATE = int(os.getenv("MINTCORE_INTEREST_RATE", "5"))
+DEBT_CAP      = int(os.getenv("MINTCORE_DEBT_CAP",      "-1000"))
+CACHE_TTL     = int(os.getenv("MINTCORE_CACHE_TTL",     "300"))
+LIVE_RATE_URL = "https://open.er-api.com/v6/latest/{base}"
+---
+
+# ============================================================
+# src/mintcore/database.py
+# ============================================================
+
+make-file "src/mintcore/database.py" with ---
+from contextlib import contextmanager
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base
+from mintcore import config
+
+engine       = create_engine(config.DATABASE_URL,
+                              connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine)
+Base         = declarative_base()
+
+@contextmanager
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+---
+
+# ============================================================
+# src/mintcore/models.py
+# ============================================================
+
+make-file "src/mintcore/models.py" with ---
+import uuid
+from sqlalchemy import Column, String, Integer, Float, DateTime
+from sqlalchemy.sql import func
+from mintcore.database import Base
+
+def _uuid():
+    return str(uuid.uuid4())
+
+class User(Base):
+    __tablename__ = "users"
+    user_id = Column(String,  primary_key=True)
+    debt    = Column(Integer, default=0)
+
+class Currency(Base):
+    __tablename__ = "currencies"
+    currency_id = Column(String,  primary_key=True)
+    name        = Column(String,  nullable=False)
+    symbol      = Column(String,  nullable=False)
+    supply_cap  = Column(Integer, nullable=True)
+
+class Wallet(Base):
+    __tablename__ = "wallets"
+    id          = Column(String,  primary_key=True, default=_uuid)
+    user_id     = Column(String,  nullable=False)
+    currency_id = Column(String,  nullable=False)
+    balance     = Column(Integer, default=0)
+
+class ExchangeRate(Base):
+    __tablename__ = "exchange_rates"
+    id              = Column(String,   primary_key=True, default=_uuid)
+    base_currency   = Column(String,   nullable=False)
+    target_currency = Column(String,   nullable=False)
+    rate            = Column(Float,    nullable=False)
+    updated_at      = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+class Transaction(Base):
+    __tablename__ = "transactions"
+    tx_id       = Column(String,   primary_key=True, default=_uuid)
+    type        = Column(String,   nullable=False)
+    currency_id = Column(String,   nullable=True)
+    from_user   = Column(String,   nullable=False)
+    to_user     = Column(String,   nullable=False)
+    amount      = Column(Integer,  nullable=False)
+    timestamp   = Column(DateTime, server_default=func.now())
+---
+
+# ============================================================
+# src/mintcore/schemas.py
+# ============================================================
+
+make-file "src/mintcore/schemas.py" with ---
+from pydantic import BaseModel, Field
+from typing import Optional
+
+class CreateUser(BaseModel):
+    user_id: str
+
+class CreateCurrency(BaseModel):
+    currency_id: str
+    name:        str
+    symbol:      str
+    supply_cap:  Optional[int] = None
+
+class SetRate(BaseModel):
+    base:   str
+    target: str
+    rate:   float = Field(gt=0)
+
+class Mint(BaseModel):
+    to:          str
+    amount:      int = Field(gt=0)
+    currency_id: str
+
+class Burn(BaseModel):
+    from_user:   str
+    amount:      int = Field(gt=0)
+    currency_id: str
+
+class Transfer(BaseModel):
+    from_user:   str
+    to_user:     str
+    amount:      int = Field(gt=0)
+    currency_id: str
+
+class Tax(BaseModel):
+    percentage:  int = Field(gt=0, le=100)
+    currency_id: str
+
+class Loan(BaseModel):
+    user_id:     str
+    amount:      int = Field(gt=0)
+    currency_id: str
+
+class Repay(BaseModel):
+    user_id:     str
+    amount:      int = Field(gt=0)
+    currency_id: str
+---
+
+# ============================================================
+# src/mintcore/helpers.py
+# ============================================================
+
+make-file "src/mintcore/helpers.py" with ---
+import uuid
+from mintcore.models import Wallet, Transaction
+
+def get_or_create_wallet(db, user_id: str, currency_id: str) -> Wallet:
+    wallet = db.query(Wallet).filter_by(user_id=user_id, currency_id=currency_id).first()
+    if not wallet:
+        wallet = Wallet(user_id=user_id, currency_id=currency_id, balance=0)
+        db.add(wallet)
+        db.flush()
+    return wallet
+
+def log_tx(db, type: str, currency_id, from_user: str, to_user: str, amount: int):
+    db.add(Transaction(
+        tx_id       = str(uuid.uuid4()),
+        type        = type,
+        currency_id = currency_id,
+        from_user   = from_user,
+        to_user     = to_user,
+        amount      = amount,
+    ))
+---
+
+# ============================================================
+# src/mintcore/routers/__init__.py
+# ============================================================
+
+make-file "src/mintcore/routers/__init__.py" with ""
+
+# ── Copy router files (updating imports to mintcore.*) ────────
+
+make-file "src/mintcore/routers/users.py" with ---
+from fastapi import APIRouter, HTTPException
+from mintcore.database import get_db
+from mintcore.models import User, Wallet
+from mintcore.schemas import CreateUser
+
+router = APIRouter(prefix="/users", tags=["users"])
+
+@router.post("")
+def create_user(data: CreateUser):
+    with get_db() as db:
+        if db.query(User).filter_by(user_id=data.user_id).first():
+            raise HTTPException(400, "User already exists")
+        db.add(User(user_id=data.user_id))
+        db.commit()
+    return {"status": "created", "user_id": data.user_id}
+
+@router.get("")
+def list_users():
+    with get_db() as db:
+        users = db.query(User).all()
+        return [{"user_id": u.user_id, "debt": u.debt} for u in users]
+
+@router.get("/{user_id}/balance")
+def get_balance(user_id: str):
+    with get_db() as db:
+        user = db.query(User).filter_by(user_id=user_id).first()
+        if not user:
+            raise HTTPException(404, "User not found")
+        wallets = db.query(Wallet).filter_by(user_id=user_id).all()
+        return {
+            "user_id": user_id,
+            "debt":    user.debt,
+            "wallets": {w.currency_id: w.balance for w in wallets},
+        }
+---
+
+make-file "src/mintcore/routers/transactions.py" with ---
+from fastapi import APIRouter, HTTPException
+from mintcore.database import get_db
+from mintcore.models import User, Transaction
+from mintcore.schemas import Transfer, Repay
+from mintcore import config
+from mintcore.helpers import get_or_create_wallet, log_tx
+
+router = APIRouter(tags=["transactions"])
+
+@router.post("/transactions/transfer")
+def transfer(data: Transfer):
+    with get_db() as db:
+        sender   = db.query(User).filter_by(user_id=data.from_user).first()
+        receiver = db.query(User).filter_by(user_id=data.to_user).first()
+        if not sender or not receiver:
+            raise HTTPException(404, "User not found")
+        sw = get_or_create_wallet(db, data.from_user, data.currency_id)
+        rw = get_or_create_wallet(db, data.to_user,   data.currency_id)
+        if sw.balance - data.amount < config.DEBT_CAP:
+            raise HTTPException(400, "DEBT_LIMIT_EXCEEDED")
+        sw.balance -= data.amount
+        rw.balance += data.amount
+        if sw.balance < 0:
+            sender.debt = abs(sw.balance)
+        log_tx(db, "transfer", data.currency_id, data.from_user, data.to_user, data.amount)
+        db.commit()
+    return {"status": "success", "from_balance": sw.balance, "to_balance": rw.balance}
+
+@router.post("/repay")
+def repay_loan(data: Repay):
+    with get_db() as db:
+        user = db.query(User).filter_by(user_id=data.user_id).first()
+        if not user:
+            raise HTTPException(404, "User not found")
+        wallet = get_or_create_wallet(db, data.user_id, data.currency_id)
+        if wallet.balance < data.amount:
+            raise HTTPException(400, "INSUFFICIENT_FUNDS")
+        repay_amount = min(data.amount, user.debt)
+        if repay_amount == 0:
+            raise HTTPException(400, "NO_DEBT_TO_REPAY")
+        treasury_w          = get_or_create_wallet(db, config.TREASURY_ID, data.currency_id)
+        wallet.balance     -= repay_amount
+        user.debt          -= repay_amount
+        treasury_w.balance += repay_amount
+        log_tx(db, "repay", data.currency_id, data.user_id, config.TREASURY_ID, repay_amount)
+        db.commit()
+    return {
+        "status":         "repaid",
+        "repaid_amount":  repay_amount,
+        "remaining_debt": user.debt,
+        "excess_ignored": data.amount - repay_amount,
+    }
+
+@router.get("/ledger")
+def get_ledger():
+    with get_db() as db:
+        txs = db.query(Transaction).order_by(Transaction.timestamp.desc()).all()
+        return [_fmt(t) for t in txs]
+
+@router.get("/ledger/{user_id}")
+def get_user_ledger(user_id: str):
+    with get_db() as db:
+        txs = db.query(Transaction).filter(
+            (Transaction.from_user == user_id) | (Transaction.to_user == user_id)
+        ).order_by(Transaction.timestamp.desc()).all()
+        return [_fmt(t) for t in txs]
+
+def _fmt(t):
+    return {
+        "tx_id": t.tx_id, "type": t.type, "currency_id": t.currency_id,
+        "from_user": t.from_user, "to_user": t.to_user,
+        "amount": t.amount, "timestamp": str(t.timestamp),
+    }
+---
+
+make-file "src/mintcore/routers/admin.py" with ---
+from fastapi import APIRouter, HTTPException, Header
+from sqlalchemy import func
+from mintcore.database import get_db
+from mintcore.models import User, Currency, Wallet, ExchangeRate
+from mintcore.schemas import CreateCurrency, Mint, Burn, Tax, Loan, SetRate
+from mintcore import config
+from mintcore.helpers import get_or_create_wallet, log_tx
+
+router = APIRouter(prefix="/admin", tags=["admin"])
+
+def _auth(key: str):
+    if key != config.ADMIN_KEY:
+        raise HTTPException(403, "Unauthorized")
+
+@router.post("/currency")
+def create_currency(data: CreateCurrency, x_admin_key: str = Header(None)):
+    _auth(x_admin_key)
+    with get_db() as db:
+        if db.query(Currency).filter_by(currency_id=data.currency_id).first():
+            raise HTTPException(400, "Currency already exists")
+        db.add(Currency(**data.model_dump()))
+        db.commit()
+    return {"status": "currency_created", "currency_id": data.currency_id}
+
+@router.get("/currency")
+def list_currencies(x_admin_key: str = Header(None)):
+    _auth(x_admin_key)
+    with get_db() as db:
+        return [{"currency_id": c.currency_id, "name": c.name,
+                 "symbol": c.symbol, "supply_cap": c.supply_cap}
+                for c in db.query(Currency).all()]
+
+@router.post("/rates")
+def set_rate(data: SetRate, x_admin_key: str = Header(None)):
+    _auth(x_admin_key)
+    with get_db() as db:
+        existing = db.query(ExchangeRate).filter_by(
+            base_currency=data.base, target_currency=data.target).first()
+        if existing:
+            existing.rate = data.rate
+        else:
+            db.add(ExchangeRate(base_currency=data.base,
+                                target_currency=data.target, rate=data.rate))
+        db.commit()
+    return {"status": "rate_set", "pair": f"{data.base}/{data.target}", "rate": data.rate}
+
+@router.post("/mint")
+def mint(data: Mint, x_admin_key: str = Header(None)):
+    _auth(x_admin_key)
+    with get_db() as db:
+        cur = db.query(Currency).filter_by(currency_id=data.currency_id).first()
+        if not cur:
+            raise HTTPException(404, "Currency not found")
+        if cur.supply_cap is not None:
+            total = db.query(func.sum(Wallet.balance)).filter_by(
+                currency_id=data.currency_id).scalar() or 0
+            if total + data.amount > cur.supply_cap:
+                raise HTTPException(400, "SUPPLY_CAP_EXCEEDED")
+        if not db.query(User).filter_by(user_id=data.to).first():
+            db.add(User(user_id=data.to))
+        wallet = get_or_create_wallet(db, data.to, data.currency_id)
+        wallet.balance += data.amount
+        log_tx(db, "mint", data.currency_id, "system", data.to, data.amount)
+        db.commit()
+    return {"status": "minted", "to": data.to,
+            "amount": data.amount, "currency": data.currency_id}
+
+@router.post("/burn")
+def burn(data: Burn, x_admin_key: str = Header(None)):
+    _auth(x_admin_key)
+    with get_db() as db:
+        wallet = get_or_create_wallet(db, data.from_user, data.currency_id)
+        if wallet.balance < data.amount:
+            raise HTTPException(400, "INSUFFICIENT_BALANCE_TO_BURN")
+        wallet.balance -= data.amount
+        log_tx(db, "burn", data.currency_id, data.from_user, "system", data.amount)
+        db.commit()
+    return {"status": "burned", "amount": data.amount}
+
+@router.post("/tax")
+def apply_tax(data: Tax, x_admin_key: str = Header(None)):
+    _auth(x_admin_key)
+    collected = 0
+    with get_db() as db:
+        treasury = get_or_create_wallet(db, config.TREASURY_ID, data.currency_id)
+        wallets  = db.query(Wallet).filter(
+            Wallet.currency_id == data.currency_id,
+            Wallet.user_id    != config.TREASURY_ID,
+            Wallet.balance     > 0,
+        ).all()
+        for w in wallets:
+            tax = int(w.balance * (data.percentage / 100))
+            if tax == 0:
+                continue
+            w.balance        -= tax
+            treasury.balance += tax
+            collected        += tax
+            log_tx(db, "tax", data.currency_id, w.user_id, config.TREASURY_ID, tax)
+        db.commit()
+    return {"status": "tax_applied", "rate": data.percentage,
+            "currency": data.currency_id, "total_collected": collected}
+
+@router.post("/loan")
+def give_loan(data: Loan, x_admin_key: str = Header(None)):
+    _auth(x_admin_key)
+    with get_db() as db:
+        user = db.query(User).filter_by(user_id=data.user_id).first()
+        if not user:
+            raise HTTPException(404, "User not found")
+        treasury = get_or_create_wallet(db, config.TREASURY_ID, data.currency_id)
+        wallet   = get_or_create_wallet(db, data.user_id,       data.currency_id)
+        user.debt              += data.amount
+        wallet.balance         += data.amount
+        treasury.balance       -= data.amount
+        log_tx(db, "loan", data.currency_id, config.TREASURY_ID, data.user_id, data.amount)
+        db.commit()
+    return {"status": "loan_given", "debt": user.debt}
+
+@router.post("/apply-interest")
+def apply_interest(x_admin_key: str = Header(None)):
+    _auth(x_admin_key)
+    total_interest = 0
+    with get_db() as db:
+        for user in db.query(User).filter(User.debt > 0).all():
+            interest = int(user.debt * (config.INTEREST_RATE / 100))
+            if interest == 0:
+                continue
+            user.debt      += interest
+            total_interest += interest
+            log_tx(db, "interest", None, user.user_id, config.TREASURY_ID, interest)
+        db.commit()
+    return {"status": "interest_applied",
+            "rate": config.INTEREST_RATE, "total_charged": total_interest}
+---
+
+make-file "src/mintcore/routers/rates.py" with ---
+import time
+import httpx
+from fastapi import APIRouter, HTTPException
+from mintcore.database import get_db
+from mintcore.models import ExchangeRate
+from mintcore import config
+
+router = APIRouter(prefix="/rate", tags=["rates"])
+_cache: dict = {}
+
+async def fetch_live_rate(base: str, target: str):
+    key = f"{base}_{target}"
+    now = time.time()
+    if key in _cache and now - _cache[key]["time"] < config.CACHE_TTL:
+        return _cache[key]["rate"], "cache"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            res  = await client.get(config.LIVE_RATE_URL.format(base=base))
+            res.raise_for_status()
+            data = res.json()
+            rate = data["rates"].get(target)
+            if rate is None:
+                return None, None
+            _cache[key] = {"rate": rate, "time": now}
+            return rate, "live"
+    except (httpx.RequestError, httpx.HTTPStatusError, KeyError) as e:
+        print(f"[rate fetch error] {base}/{target}: {e}")
+        return None, None
+
+@router.get("/{base}/{target}")
+async def get_rate(base: str, target: str):
+    rate, source = await fetch_live_rate(base.upper(), target.upper())
+    if rate:
+        return {"base": base, "target": target, "rate": rate, "source": source}
+    with get_db() as db:
+        stored = db.query(ExchangeRate).filter_by(
+            base_currency=base.upper(), target_currency=target.upper()).first()
+        if stored:
+            return {"base": base, "target": target,
+                    "rate": stored.rate, "source": "stored"}
+    raise HTTPException(404, "Rate not found — set one via /admin/rates")
+---
+
+make-file "src/mintcore/routers/analytics.py" with ---
+from fastapi import APIRouter
+from sqlalchemy import func
+from mintcore.database import get_db
+from mintcore.models import Wallet, Transaction, User
+from datetime import datetime, timedelta
+
+router = APIRouter(prefix="/analytics", tags=["analytics"])
+
+@router.get("/supply")
+def supply_by_currency():
+    with get_db() as db:
+        rows = db.query(Wallet.currency_id, func.sum(Wallet.balance))\
+                 .group_by(Wallet.currency_id).all()
+        return {"supply": {cid: total for cid, total in rows}}
+
+@router.get("/velocity")
+def transaction_velocity(hours: int = 24):
+    since = datetime.utcnow() - timedelta(hours=hours)
+    with get_db() as db:
+        rows = db.query(Transaction.currency_id,
+                        func.sum(Transaction.amount), func.count())\
+                 .filter(Transaction.timestamp >= since)\
+                 .group_by(Transaction.currency_id).all()
+        return {"window_hours": hours, "velocity": {
+            cid: {"volume": vol, "tx_count": count}
+            for cid, vol, count in rows if cid
+        }}
+
+@router.get("/richlist/{currency_id}")
+def richlist(currency_id: str, limit: int = 10):
+    with get_db() as db:
+        rows = db.query(Wallet.user_id, Wallet.balance)\
+                 .filter(Wallet.currency_id == currency_id,
+                         Wallet.user_id != "treasury")\
+                 .order_by(Wallet.balance.desc()).limit(limit).all()
+        return {"currency_id": currency_id,
+                "richlist": [{"user_id": u, "balance": b} for u, b in rows]}
+
+@router.get("/debt")
+def debt_overview():
+    with get_db() as db:
+        users = db.query(User).filter(User.debt > 0).order_by(User.debt.desc()).all()
+        return {"total_debt": sum(u.debt for u in users),
+                "debtors": [{"user_id": u.user_id, "debt": u.debt} for u in users]}
+
+@router.get("/stats")
+def global_stats():
+    with get_db() as db:
+        supply_rows = db.query(Wallet.currency_id, func.sum(Wallet.balance))\
+                       .group_by(Wallet.currency_id).all()
+        return {
+            "user_count":         db.query(User).count(),
+            "total_debt":         db.query(func.sum(User.debt)).scalar() or 0,
+            "total_tx":           db.query(Transaction).count(),
+            "supply_by_currency": {cid: total for cid, total in supply_rows},
+        }
+---
+
+# ============================================================
+# src/mintcore/cli.py  — `mintcore` command entrypoint
+# ============================================================
+
+make-file "src/mintcore/cli.py" with ---
+"""
+mintcore CLI — installed as `mintcore` command via pyproject.toml scripts.
+
+Usage:
+    mintcore start                  # Start the API server
+    mintcore start --port 9000      # Custom port
+    mintcore init                   # Write a .env template
+    mintcore status                 # Check if server is running
+    mintcore admin mint ...         # Admin commands (pass-through to API)
+"""
+import os
+import typer
+import httpx
+from rich.console import Console
+from rich.table   import Table
+from rich.panel   import Panel
+
+app     = typer.Typer(help="MintCore — virtual currency engine CLI")
+admin   = typer.Typer(help="Admin commands")
+app.add_typer(admin, name="admin")
+
+console = Console()
+
+def _base_url():
+    return os.getenv("MINTCORE_URL", "http://127.0.0.1:8000")
+
+def _headers():
+    return {"X-Admin-Key": os.getenv("MINTCORE_ADMIN_KEY", "admin-secret")}
+
+# ── mintcore start ────────────────────────────────────────────
+
+@app.command()
+def start(
+    host:   str = typer.Option("127.0.0.1", help="Bind host"),
+    port:   int = typer.Option(8000,        help="Bind port"),
+    reload: bool = typer.Option(False,      help="Hot reload (dev mode)"),
+):
+    """Start the MintCore API server."""
+    import uvicorn
+    from mintcore.app import create_app
+
+    console.print(Panel(
+        f"[bold green]MintCore[/] starting on [cyan]http://{host}:{port}[/]\n"
+        f"Docs → [cyan]http://{host}:{port}/docs[/]",
+        title="🪙 MintCore", border_style="green",
+    ))
+    uvicorn.run("mintcore.app:create_app", host=host, port=port,
+                reload=reload, factory=True)
+
+# ── mintcore init ─────────────────────────────────────────────
+
+@app.command()
+def init():
+    """Write a .env template to the current directory."""
+    env_path = ".env"
+    if os.path.exists(env_path):
+        console.print("[yellow].env already exists — skipping.[/]")
+        return
+    with open(env_path, "w") as f:
+        f.write(
+            "MINTCORE_ADMIN_KEY=admin-secret\n"
+            "MINTCORE_DB_URL=sqlite:///./mintcore.db\n"
+            "MINTCORE_TREASURY=treasury\n"
+            "MINTCORE_INTEREST_RATE=5\n"
+            "MINTCORE_DEBT_CAP=-1000\n"
+            "MINTCORE_CACHE_TTL=300\n"
+        )
+    console.print("[green]✓ .env written.[/] Edit it before going to production.")
+
+# ── mintcore status ───────────────────────────────────────────
+
+@app.command()
+def status():
+    """Check whether the MintCore server is reachable."""
+    url = _base_url()
+    try:
+        r = httpx.get(f"{url}/analytics/stats", timeout=3.0)
+        r.raise_for_status()
+        data = r.json()
+        console.print(Panel(
+            f"[green]● Online[/]  {url}\n\n"
+            f"Users: [bold]{data['user_count']}[/]   "
+            f"Transactions: [bold]{data['total_tx']}[/]   "
+            f"Total debt: [bold]{data['total_debt']}[/]",
+            title="MintCore Status", border_style="green",
+        ))
+    except Exception:
+        console.print(Panel(
+            f"[red]● Offline[/]  {url}\n\nIs the server running? Try [bold]mintcore start[/].",
+            title="MintCore Status", border_style="red",
+        ))
+
+# ── mintcore admin mint ───────────────────────────────────────
+
+@admin.command("mint")
+def admin_mint(
+    to:       str = typer.Argument(..., help="User ID"),
+    amount:   int = typer.Argument(..., help="Amount"),
+    currency: str = typer.Argument(..., help="Currency ID"),
+):
+    """Mint currency to a user."""
+    r = httpx.post(f"{_base_url()}/admin/mint",
+                   json={"to": to, "amount": amount, "currency_id": currency},
+                   headers=_headers())
+    console.print(r.json())
+
+@admin.command("burn")
+def admin_burn(
+    from_user: str = typer.Argument(..., help="User ID"),
+    amount:    int = typer.Argument(..., help="Amount"),
+    currency:  str = typer.Argument(..., help="Currency ID"),
+):
+    """Burn currency from a user."""
+    r = httpx.post(f"{_base_url()}/admin/burn",
+                   json={"from_user": from_user, "amount": amount, "currency_id": currency},
+                   headers=_headers())
+    console.print(r.json())
+
+@admin.command("tax")
+def admin_tax(
+    percentage: int = typer.Argument(..., help="Tax percentage"),
+    currency:   str = typer.Argument(..., help="Currency ID"),
+):
+    """Apply a tax sweep."""
+    r = httpx.post(f"{_base_url()}/admin/tax",
+                   json={"percentage": percentage, "currency_id": currency},
+                   headers=_headers())
+    console.print(r.json())
+
+@admin.command("interest")
+def admin_interest():
+    """Apply interest to all outstanding debts."""
+    r = httpx.post(f"{_base_url()}/admin/apply-interest", headers=_headers())
+    console.print(r.json())
+
+@admin.command("currency")
+def admin_currency(
+    currency_id: str = typer.Argument(..., help="Short ID e.g. GLD"),
+    name:        str = typer.Argument(..., help="Full name e.g. Gold"),
+    symbol:      str = typer.Argument(..., help="Symbol e.g. G"),
+    supply_cap:  int = typer.Option(0,    help="Max supply (0 = unlimited)"),
+):
+    """Create a new virtual currency."""
+    payload = {"currency_id": currency_id, "name": name, "symbol": symbol}
+    if supply_cap > 0:
+        payload["supply_cap"] = supply_cap
+    r = httpx.post(f"{_base_url()}/admin/currency", json=payload, headers=_headers())
+    console.print(r.json())
+
+@admin.command("stats")
+def admin_stats():
+    """Show economy-wide stats."""
+    r = httpx.get(f"{_base_url()}/analytics/stats")
+    data = r.json()
+    t = Table("Metric", "Value")
+    t.add_row("Users",        str(data["user_count"]))
+    t.add_row("Transactions", str(data["total_tx"]))
+    t.add_row("Total debt",   str(data["total_debt"]))
+    for cid, supply in data.get("supply_by_currency", {}).items():
+        t.add_row(f"Supply ({cid})", str(supply))
+    console.print(t)
+
+@admin.command("richlist")
+def admin_richlist(
+    currency: str = typer.Argument(..., help="Currency ID"),
+    limit:    int = typer.Option(10, help="Number of entries"),
+):
+    """Top holders for a currency."""
+    r    = httpx.get(f"{_base_url()}/analytics/richlist/{currency}?limit={limit}")
+    data = r.json()
+    t    = Table("Rank", "User", "Balance")
+    for i, row in enumerate(data["richlist"], 1):
+        t.add_row(str(i), row["user_id"], f"{row['balance']:,}")
+    console.print(t)
+
+if __name__ == "__main__":
+    app()
+---
+
+# ============================================================
+# src/mintcore/bot/  — same bot code, updated imports
+# ============================================================
+
+make-file "src/mintcore/bot/__init__.py" with ""
+make-file "src/mintcore/bot/cogs/__init__.py" with ""
+
+make-file "src/mintcore/bot/client.py" with ---
+"""Async HTTP client wrapping the MintCore REST API."""
+import os
+import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
+
+BASE_URL  = os.getenv("MINTCORE_URL",       "http://127.0.0.1:8000")
+ADMIN_KEY = os.getenv("MINTCORE_ADMIN_KEY", "admin-secret")
+HEADERS   = {"X-Admin-Key": ADMIN_KEY}
+
+_client: httpx.AsyncClient | None = None
+
+async def get_client() -> httpx.AsyncClient:
+    global _client
+    if _client is None or _client.is_closed:
+        _client = httpx.AsyncClient(base_url=BASE_URL, timeout=10.0)
+    return _client
+
+async def close_client():
+    global _client
+    if _client and not _client.is_closed:
+        await _client.aclose()
+
+async def _get(path):
+    c = await get_client(); r = await c.get(path); r.raise_for_status(); return r.json()
+async def _post(path, json=None, headers=None):
+    c = await get_client(); r = await c.post(path, json=json, headers=headers or {}); r.raise_for_status(); return r.json()
+
+async def get_balance(uid):        return await _get(f"/users/{uid}/balance")
+async def ensure_user(uid):        return await _post("/users", {"user_id": uid})
+async def get_ledger(uid):         return await _get(f"/ledger/{uid}")
+async def get_rate(base, target):  return await _get(f"/rate/{base}/{target}")
+async def get_stats():             return await _get("/analytics/stats")
+async def get_richlist(cid, n=10): return await _get(f"/analytics/richlist/{cid}?limit={n}")
+
+async def transfer(from_user, to_user, amount, currency_id):
+    return await _post("/transactions/transfer",
+        {"from_user": from_user, "to_user": to_user, "amount": amount, "currency_id": currency_id})
+
+async def take_loan(user_id, amount, currency_id):
+    return await _post("/admin/loan",
+        {"user_id": user_id, "amount": amount, "currency_id": currency_id}, HEADERS)
+
+async def repay_loan(user_id, amount, currency_id):
+    return await _post("/repay",
+        {"user_id": user_id, "amount": amount, "currency_id": currency_id})
+
+async def admin_mint(to, amount, currency_id):
+    return await _post("/admin/mint",
+        {"to": to, "amount": amount, "currency_id": currency_id}, HEADERS)
+
+async def admin_burn(from_user, amount, currency_id):
+    return await _post("/admin/burn",
+        {"from_user": from_user, "amount": amount, "currency_id": currency_id}, HEADERS)
+
+async def admin_tax(percentage, currency_id):
+    return await _post("/admin/tax",
+        {"percentage": percentage, "currency_id": currency_id}, HEADERS)
+
+async def admin_apply_interest():
+    return await _post("/admin/apply-interest", headers=HEADERS)
+
+async def admin_create_currency(currency_id, name, symbol, supply_cap=None):
+    payload = {"currency_id": currency_id, "name": name, "symbol": symbol}
+    if supply_cap: payload["supply_cap"] = supply_cap
+    return await _post("/admin/currency", payload, HEADERS)
+---
+
+# bot/embeds.py and bot/cogs/ are identical to previous scaffold
+# (imports don't need changing — they only import from bot.client)
+# Copy them from your existing mintcore/bot/ folder, or re-run mintcore_bot.bc
+
+make-file "src/mintcore/bot/main.py" with ---
+"""
+Entry point for the MintCore Discord bot.
+
+Install:  pip install mintcore[bot]
+Configure: mintcore init  (fills .env)
+Run:       python -m mintcore.bot.main
+"""
+import os
+import asyncio
+import discord
+from discord.ext import commands
+from dotenv import load_dotenv
+from mintcore.bot.client import close_client
+
+load_dotenv()
+
+TOKEN = os.getenv("DISCORD_TOKEN")
+if not TOKEN:
+    raise RuntimeError("DISCORD_TOKEN not set — run `mintcore init` and fill in .env")
+
+intents         = discord.Intents.default()
+intents.members = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+COGS = ["mintcore.bot.cogs.player", "mintcore.bot.cogs.admin"]
+
+@bot.event
+async def on_ready():
+    await bot.tree.sync()
+    print(f"[MintCore Bot] Logged in as {bot.user} — slash commands synced.")
+
+@bot.event
+async def on_disconnect():
+    await close_client()
+
+async def main():
+    async with bot:
+        for cog in COGS:
+            await bot.load_extension(cog)
+        await bot.start(TOKEN)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+---
+
+# ============================================================
+# tests/
+# ============================================================
+
+make-file "tests/__init__.py" with ""
+
+make-file "tests/conftest.py" with ---
+import pytest
+from fastapi.testclient import TestClient
+from mintcore.app import create_app
+
+@pytest.fixture(scope="session")
+def client():
+    app = create_app()
+    with TestClient(app) as c:
+        yield c
+
+@pytest.fixture(scope="session")
+def admin_headers():
+    return {"X-Admin-Key": "admin-secret"}
+---
+
+make-file "tests/test_core.py" with ---
+"""Core engine smoke tests."""
+
+def setup_module():
+    from fastapi.testclient import TestClient
+    from mintcore.app import create_app
+    c = TestClient(create_app())
+    c.post("/admin/currency",
+           json={"currency_id": "GLD", "name": "Gold", "symbol": "G"},
+           headers={"X-Admin-Key": "admin-secret"})
+    c.post("/users", json={"user_id": "alice"})
+    c.post("/users", json={"user_id": "bob"})
+
+def test_mint_and_balance(client, admin_headers):
+    client.post("/admin/mint",
+                json={"to": "alice", "amount": 500, "currency_id": "GLD"},
+                headers=admin_headers)
+    r = client.get("/users/alice/balance")
+    assert r.status_code == 200
+    assert r.json()["wallets"]["GLD"] == 500
+
+def test_transfer(client):
+    r = client.post("/transactions/transfer", json={
+        "from_user": "alice", "to_user": "bob",
+        "amount": 100, "currency_id": "GLD",
+    })
+    assert r.status_code == 200
+    assert r.json()["from_balance"] == 400
+
+def test_debt_cap(client):
+    r = client.post("/transactions/transfer", json={
+        "from_user": "bob", "to_user": "alice",
+        "amount": 9999, "currency_id": "GLD",
+    })
+    assert r.status_code == 400
+
+def test_analytics(client):
+    r = client.get("/analytics/stats")
+    assert "user_count" in r.json()
+    assert "supply_by_currency" in r.json()
+---
+
+# ============================================================
+# LICENSE
+# ============================================================
+
+make-file "LICENSE" with ---
+Server-Lab Open-Control License (SOCL) 1.0
+====================================
+Copyright (c) 2025 Sourasish Das
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to use,
+copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+1. Attribution.
+   The original copyright notice and this license text must be retained in
+   all copies or substantial portions of the Software. If you distribute
+   compiled or packaged forms of the Software, you must include the copyright
+   notice and a copy of this license in a file distributed with those forms.
+
+2. Open-source grant.
+   The rights granted in this license are intended to be open-source in nature:
+   recipients may use, study, modify, and redistribute the Software under the
+   terms set forth herein.
+
+3. Ownership and control.
+   Copyright and all intellectual property rights in the Software are and remain
+   the exclusive property of the Copyright Owner named above. The Copyright
+   Owner retains sole authority to relicense, alter, or otherwise change the
+   licensing terms that apply to future distributions of the Software.
+
+4. License changes; effective date.
+   The Copyright Owner may change or replace this license at any time and
+   without notice. Any such change applies only to versions or distributions
+   of the Software that the Copyright Owner explicitly distributes after the
+   change takes effect. Copies of the Software already distributed by the
+   Copyright Owner under a prior version of this license remain governed by
+   the terms under which those copies were originally distributed.
+
+5. No trademark rights.
+   This license does not grant any rights to use the Copyright Owner's trade
+   names, trademarks, service marks, or logos.
+
+6. No warranty.
+   THE SOFTWARE IS PROVIDED "AS IS" AND THE COPYRIGHT OWNER DISCLAIMS ALL
+   WARRANTIES, EXPRESS OR IMPLIED, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+   WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND
+   NON-INFRINGEMENT. USE OF THE SOFTWARE IS AT YOUR OWN RISK.
+
+7. Limitation of liability.
+   IN NO EVENT SHALL THE COPYRIGHT OWNER BE LIABLE FOR ANY CLAIM, DAMAGES OR
+   OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+   ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+   DEALINGS IN THE SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+8. Contributor submissions.
+   By submitting a contribution to the project, a contributor grants the
+   Copyright Owner a perpetual, irrevocable, worldwide, royalty-free,
+   transferable license to use, reproduce, modify, distribute, sublicense,
+   and otherwise exploit the contribution as part of the Software.
+
+9. Termination.
+   This license and the rights granted hereunder will terminate automatically
+   if you fail to comply with any term of this license. Termination does not
+   affect any rights that were already granted to recipients prior to the
+   termination event with respect to copies distributed while the license was
+   in effect for that distribution.
+
+10. Governing law.
+    This license does not select a governing law; legal disputes shall be
+    governed by the laws applicable where enforcement is sought, subject to
+    applicable conflict-of-law rules.
+
+[END OF LICENSE]
+---
+
+# ============================================================
+# README.md
+# ============================================================
+
+make-file "README.md" with ---
+# MintCore
+
+[![PyPI](https://img.shields.io/pypi/v/mintcore)](https://pypi.org/project/mintcore/)
+[![Python](https://img.shields.io/pypi/pyversions/mintcore)](https://pypi.org/project/mintcore/)
+[![License: SOCL-1.0](https://img.shields.io/badge/License-SOCL--1.0-blue.svg)](LICENSE)
+
+Centralized virtual currency engine for game economies.
+FastAPI + SQLAlchemy + a `mintcore` CLI out of the box.
+
+## Install
+
+```bash
+pip install mintcore           # core engine + CLI
+pip install mintcore[bot]      # + Discord bot support
+pip install mintcore[dev]      # + dev/test tools
+```
+
+## Quickstart
+
+```bash
+mintcore init    # writes .env template
+mintcore start   # starts API on http://127.0.0.1:8000
+```
+
+Or embed directly in your code:
+
+```python
+from mintcore import MintCore
+
+engine = MintCore(
+    database_url="sqlite:///./mygame.db",
+    admin_key="super-secret",
+    debt_cap=-500,
+)
+engine.run(host="0.0.0.0", port=8000)
+```
+
+## CLI
+
+```bash
+mintcore start                             # start API server
+mintcore init                              # write .env template
+mintcore status                            # check server health
+
+mintcore admin currency GLD Gold G        # create currency
+mintcore admin mint player1 500 GLD       # mint to player
+mintcore admin tax 5 GLD                  # 5% tax sweep
+mintcore admin interest                   # apply interest
+mintcore admin stats                      # economy snapshot
+mintcore admin richlist GLD               # top holders
+```
+
+## Discord bot
+
+```bash
+# Add your DISCORD_TOKEN to .env, then:
+python -m mintcore.bot.main
+```
+
+See [discord bot docs]({{github}}/blob/main/docs/bot.md) for slash command reference.
+
+## Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `MINTCORE_ADMIN_KEY` | `admin-secret` | Admin API key |
+| `MINTCORE_DB_URL` | `sqlite:///./mintcore.db` | SQLAlchemy DB URL |
+| `MINTCORE_TREASURY` | `treasury` | Treasury account ID |
+| `MINTCORE_INTEREST_RATE` | `5` | Interest % per cycle |
+| `MINTCORE_DEBT_CAP` | `-1000` | Max overdraft |
+| `MINTCORE_CACHE_TTL` | `300` | Rate cache TTL (seconds) |
+| `DISCORD_TOKEN` | — | Discord bot token |
+
+## Publishing to PyPI
+
+```bash
+pip install hatch twine
+hatch build
+twine upload dist/*
+```
+---
+
+# ============================================================
+# docs/publishing.md  — step-by-step PyPI guide
+# ============================================================
+
+make-file "docs/publishing.md" with ---
+# Publishing MintCore to PyPI
+
+## First time setup
+
+1. Create accounts at https://pypi.org and https://test.pypi.org
+2. Generate an API token at PyPI → Account settings → API tokens
+3. Store it in `~/.pypirc`:
+
+```ini
+[pypi]
+  username = __token__
+  password = pypi-YOUR-TOKEN-HERE
+
+[testpypi]
+  username = __token__
+  password = pypi-YOUR-TESTPYPI-TOKEN-HERE
+```
+
+## Build and publish
+
+```bash
+# Install build tools
+pip install hatch twine
+
+# Build wheel + sdist
+hatch build
+# → dist/mintcore-1.0.0-py3-none-any.whl
+# → dist/mintcore-1.0.0.tar.gz
+
+# Test on TestPyPI first
+twine upload --repository testpypi dist/*
+pip install --index-url https://test.pypi.org/simple/ mintcore
+
+# Publish to real PyPI
+twine upload dist/*
+```
+
+## Bump version for a new release
+
+Edit `version` in `pyproject.toml` and `src/mintcore/__init__.py`,
+then rebuild:
+
+```bash
+hatch build
+twine upload dist/*
+```
+---
+
+print ""
+print "MintCore PyPI package scaffold complete!"
+print ""
+print "  cd mintcore-pkg"
+print "  pip install -e '.[dev]'    # editable install"
+print "  pytest                     # run tests"
+print "  mintcore init              # write .env"
+print "  mintcore start             # start server"
+print ""
+print "  To publish:"
+print "  hatch build"
+print "  twine upload dist/*"
+print ""

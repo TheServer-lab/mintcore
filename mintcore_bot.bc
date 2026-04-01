@@ -1,0 +1,891 @@
+# ============================================================
+# MintCore Discord Bot
+# Drops into your existing mintcore/ project folder
+# Run: bytecraft mintcore_bot.bc
+# ============================================================
+
+strict on
+
+set project "mintcore"
+set version "1.0.0"
+
+print "Scaffolding MintCore Discord bot..."
+
+set-working-folder "{{project}}"
+
+# ============================================================
+# Add discord.py to requirements
+# ============================================================
+
+append-file "requirements.txt" with ---
+discord.py
+python-dotenv
+---
+
+# ============================================================
+# .env  (template — user fills in real values)
+# ============================================================
+
+make-file ".env" with ---
+DISCORD_TOKEN=your-bot-token-here
+MINTCORE_URL=http://127.0.0.1:8000
+MINTCORE_ADMIN_KEY=admin-secret
+ADMIN_ROLE_NAME=MintAdmin
+---
+
+# ============================================================
+# .env.example  (safe to commit)
+# ============================================================
+
+make-file ".env.example" with ---
+DISCORD_TOKEN=
+MINTCORE_URL=http://127.0.0.1:8000
+MINTCORE_ADMIN_KEY=admin-secret
+ADMIN_ROLE_NAME=MintAdmin
+---
+
+# ============================================================
+# bot/  folder structure
+# ============================================================
+
+make-folder "bot"
+make-folder "bot/cogs"
+
+# ============================================================
+# bot/__init__.py
+# ============================================================
+
+make-file "bot/__init__.py" with ""
+
+# ============================================================
+# bot/client.py  — shared httpx client to talk to MintCore API
+# ============================================================
+
+make-file "bot/client.py" with ---
+"""
+Thin async wrapper around the MintCore REST API.
+All bot cogs import from here — one place to change the base URL or auth.
+"""
+import os
+import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
+
+BASE_URL  = os.getenv("MINTCORE_URL", "http://127.0.0.1:8000")
+ADMIN_KEY = os.getenv("MINTCORE_ADMIN_KEY", "admin-secret")
+HEADERS   = {"X-Admin-Key": ADMIN_KEY}
+
+_client: httpx.AsyncClient | None = None
+
+async def get_client() -> httpx.AsyncClient:
+    global _client
+    if _client is None or _client.is_closed:
+        _client = httpx.AsyncClient(base_url=BASE_URL, timeout=10.0)
+    return _client
+
+async def close_client():
+    global _client
+    if _client and not _client.is_closed:
+        await _client.aclose()
+
+# ── Player endpoints ──────────────────────────────────────────
+
+async def get_balance(user_id: str) -> dict:
+    c = await get_client()
+    r = await c.get(f"/users/{user_id}/balance")
+    r.raise_for_status()
+    return r.json()
+
+async def ensure_user(user_id: str) -> dict:
+    """Create user account if it doesn't exist yet."""
+    c = await get_client()
+    r = await c.post("/users", json={"user_id": user_id})
+    return r.json()
+
+async def transfer(from_user: str, to_user: str, amount: int, currency_id: str) -> dict:
+    c = await get_client()
+    r = await c.post("/transactions/transfer", json={
+        "from_user":   from_user,
+        "to_user":     to_user,
+        "amount":      amount,
+        "currency_id": currency_id,
+    })
+    r.raise_for_status()
+    return r.json()
+
+async def take_loan(user_id: str, amount: int, currency_id: str) -> dict:
+    c = await get_client()
+    r = await c.post("/admin/loan", json={
+        "user_id":     user_id,
+        "amount":      amount,
+        "currency_id": currency_id,
+    }, headers=HEADERS)
+    r.raise_for_status()
+    return r.json()
+
+async def repay_loan(user_id: str, amount: int, currency_id: str) -> dict:
+    c = await get_client()
+    r = await c.post("/repay", json={
+        "user_id":     user_id,
+        "amount":      amount,
+        "currency_id": currency_id,
+    })
+    r.raise_for_status()
+    return r.json()
+
+async def get_ledger(user_id: str) -> list:
+    c = await get_client()
+    r = await c.get(f"/ledger/{user_id}")
+    r.raise_for_status()
+    return r.json()
+
+async def get_rate(base: str, target: str) -> dict:
+    c = await get_client()
+    r = await c.get(f"/rate/{base}/{target}")
+    r.raise_for_status()
+    return r.json()
+
+# ── Admin endpoints ───────────────────────────────────────────
+
+async def admin_mint(to: str, amount: int, currency_id: str) -> dict:
+    c = await get_client()
+    r = await c.post("/admin/mint", json={
+        "to": to, "amount": amount, "currency_id": currency_id,
+    }, headers=HEADERS)
+    r.raise_for_status()
+    return r.json()
+
+async def admin_burn(from_user: str, amount: int, currency_id: str) -> dict:
+    c = await get_client()
+    r = await c.post("/admin/burn", json={
+        "from_user": from_user, "amount": amount, "currency_id": currency_id,
+    }, headers=HEADERS)
+    r.raise_for_status()
+    return r.json()
+
+async def admin_tax(percentage: int, currency_id: str) -> dict:
+    c = await get_client()
+    r = await c.post("/admin/tax", json={
+        "percentage": percentage, "currency_id": currency_id,
+    }, headers=HEADERS)
+    r.raise_for_status()
+    return r.json()
+
+async def admin_apply_interest() -> dict:
+    c = await get_client()
+    r = await c.post("/admin/apply-interest", headers=HEADERS)
+    r.raise_for_status()
+    return r.json()
+
+async def admin_create_currency(currency_id: str, name: str, symbol: str, supply_cap: int | None) -> dict:
+    c = await get_client()
+    payload = {"currency_id": currency_id, "name": name, "symbol": symbol}
+    if supply_cap:
+        payload["supply_cap"] = supply_cap
+    r = await c.post("/admin/currency", json=payload, headers=HEADERS)
+    r.raise_for_status()
+    return r.json()
+
+async def get_stats() -> dict:
+    c = await get_client()
+    r = await c.get("/analytics/stats")
+    r.raise_for_status()
+    return r.json()
+
+async def get_richlist(currency_id: str, limit: int = 10) -> dict:
+    c = await get_client()
+    r = await c.get(f"/analytics/richlist/{currency_id}?limit={limit}")
+    r.raise_for_status()
+    return r.json()
+---
+
+# ============================================================
+# bot/embeds.py  — reusable Discord embed builders
+# ============================================================
+
+make-file "bot/embeds.py" with ---
+"""
+All Discord embeds live here — keeps cog files clean.
+"""
+import discord
+from datetime import datetime
+
+GOLD   = 0xF4C430
+GREEN  = 0x2ECC71
+RED    = 0xE74C3C
+BLUE   = 0x3498DB
+PURPLE = 0x9B59B6
+GREY   = 0x95A5A6
+
+def _base(title: str, color: int) -> discord.Embed:
+    e = discord.Embed(title=title, color=color,
+                      timestamp=datetime.utcnow())
+    e.set_footer(text="MintCore Economy Engine")
+    return e
+
+# ── Player embeds ─────────────────────────────────────────────
+
+def balance_embed(username: str, data: dict) -> discord.Embed:
+    e = _base(f"💰 Wallet — {username}", GOLD)
+    wallets = data.get("wallets", {})
+    if wallets:
+        wallet_lines = "\n".join(
+            f"**{cid}** — `{bal:,}`" for cid, bal in wallets.items()
+        )
+    else:
+        wallet_lines = "*No currency yet*"
+    e.add_field(name="Balances", value=wallet_lines, inline=False)
+    if data.get("debt", 0) > 0:
+        e.add_field(name="⚠️ Outstanding Debt", value=f"`{data['debt']:,}`", inline=False)
+        e.color = 0xE67E22
+    return e
+
+def transfer_embed(from_user: str, to_user: str,
+                   amount: int, currency_id: str,
+                   new_balance: int) -> discord.Embed:
+    e = _base("✅ Transfer Complete", GREEN)
+    e.add_field(name="From",     value=f"`{from_user}`",        inline=True)
+    e.add_field(name="To",       value=f"`{to_user}`",          inline=True)
+    e.add_field(name="Amount",   value=f"`{amount:,} {currency_id}`", inline=True)
+    e.add_field(name="Your new balance", value=f"`{new_balance:,}`", inline=False)
+    return e
+
+def loan_embed(user: str, amount: int, currency_id: str, total_debt: int) -> discord.Embed:
+    e = _base("🏦 Loan Issued", BLUE)
+    e.add_field(name="Recipient",    value=f"`{user}`",               inline=True)
+    e.add_field(name="Amount",       value=f"`{amount:,} {currency_id}`", inline=True)
+    e.add_field(name="Total debt",   value=f"`{total_debt:,}`",       inline=False)
+    e.set_footer(text="MintCore Economy Engine • Loans accrue interest each cycle")
+    return e
+
+def repay_embed(user: str, repaid: int, currency_id: str,
+                remaining: int, excess: int) -> discord.Embed:
+    e = _base("✅ Loan Repaid", GREEN)
+    e.add_field(name="Repaid",          value=f"`{repaid:,} {currency_id}`", inline=True)
+    e.add_field(name="Remaining debt",  value=f"`{remaining:,}`",            inline=True)
+    if excess > 0:
+        e.add_field(name="ℹ️ Note",
+                    value=f"`{excess:,}` was not applied (no remaining debt)",
+                    inline=False)
+    return e
+
+def ledger_embed(username: str, txs: list) -> discord.Embed:
+    e = _base(f"📒 Ledger — {username}", PURPLE)
+    if not txs:
+        e.description = "*No transactions yet.*"
+        return e
+    lines = []
+    for tx in txs[:10]:   # cap at 10 to stay within embed limits
+        ts   = str(tx.get("timestamp", ""))[:10]
+        kind = tx["type"].upper()
+        cid  = tx.get("currency_id") or ""
+        amt  = f"{tx['amount']:,}"
+        frm  = tx["from_user"]
+        to   = tx["to_user"]
+        lines.append(f"`{ts}` **{kind}** {amt} {cid}  {frm} → {to}")
+    e.description = "\n".join(lines)
+    if len(txs) > 10:
+        e.set_footer(text=f"MintCore Economy Engine • Showing 10 of {len(txs)} transactions")
+    return e
+
+def rate_embed(base: str, target: str, rate: float, source: str) -> discord.Embed:
+    e = _base(f"📈 Exchange Rate", GOLD)
+    e.add_field(name="Pair",   value=f"`{base} / {target}`", inline=True)
+    e.add_field(name="Rate",   value=f"`{rate}`",            inline=True)
+    e.add_field(name="Source", value=f"`{source}`",          inline=True)
+    return e
+
+def error_embed(msg: str) -> discord.Embed:
+    return _base(f"❌ {msg}", RED)
+
+# ── Admin embeds ──────────────────────────────────────────────
+
+def mint_embed(to: str, amount: int, currency_id: str) -> discord.Embed:
+    e = _base("🪙 Minted", GREEN)
+    e.add_field(name="To",       value=f"`{to}`",                    inline=True)
+    e.add_field(name="Amount",   value=f"`{amount:,} {currency_id}`", inline=True)
+    return e
+
+def burn_embed(from_user: str, amount: int, currency_id: str) -> discord.Embed:
+    e = _base("🔥 Burned", RED)
+    e.add_field(name="From",     value=f"`{from_user}`",             inline=True)
+    e.add_field(name="Amount",   value=f"`{amount:,} {currency_id}`", inline=True)
+    return e
+
+def tax_embed(rate: int, currency_id: str, collected: int) -> discord.Embed:
+    e = _base("🏛️ Tax Applied", GOLD)
+    e.add_field(name="Rate",      value=f"`{rate}%`",                 inline=True)
+    e.add_field(name="Currency",  value=f"`{currency_id}`",           inline=True)
+    e.add_field(name="Collected", value=f"`{collected:,}`",           inline=True)
+    return e
+
+def stats_embed(data: dict) -> discord.Embed:
+    e = _base("📊 Economy Stats", BLUE)
+    e.add_field(name="Users",       value=f"`{data['user_count']:,}`",  inline=True)
+    e.add_field(name="Transactions", value=f"`{data['total_tx']:,}`",   inline=True)
+    e.add_field(name="Total debt",  value=f"`{data['total_debt']:,}`",  inline=True)
+    supply = data.get("supply_by_currency", {})
+    if supply:
+        supply_lines = "\n".join(f"**{cid}** — `{amt:,}`" for cid, amt in supply.items())
+        e.add_field(name="Circulating supply", value=supply_lines, inline=False)
+    return e
+
+def richlist_embed(currency_id: str, entries: list) -> discord.Embed:
+    e = _base(f"🏆 Richlist — {currency_id}", GOLD)
+    medals = ["🥇", "🥈", "🥉"]
+    lines  = []
+    for i, row in enumerate(entries):
+        icon = medals[i] if i < 3 else f"`#{i+1}`"
+        lines.append(f"{icon} `{row['user_id']}` — **{row['balance']:,}**")
+    e.description = "\n".join(lines) if lines else "*No holders yet.*"
+    return e
+
+def interest_embed(rate: int, total_charged: int) -> discord.Embed:
+    e = _base("📈 Interest Applied", GOLD)
+    e.add_field(name="Rate",          value=f"`{rate}%`",           inline=True)
+    e.add_field(name="Total charged", value=f"`{total_charged:,}`", inline=True)
+    return e
+---
+
+# ============================================================
+# bot/cogs/__init__.py
+# ============================================================
+
+make-file "bot/cogs/__init__.py" with ""
+
+# ============================================================
+# bot/cogs/player.py  — all player-facing slash commands
+# ============================================================
+
+make-file "bot/cogs/player.py" with ---
+"""
+Player commands — available to everyone in any channel.
+Each Discord user's ID is their MintCore user_id, so no
+registration step is needed; accounts are auto-created.
+"""
+import discord
+from discord import app_commands
+from discord.ext import commands
+import httpx
+
+from bot import client as mc
+from bot.embeds import (
+    balance_embed, transfer_embed, loan_embed,
+    repay_embed, ledger_embed, rate_embed, error_embed,
+)
+
+class PlayerCog(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+
+    # ── /balance ──────────────────────────────────────────────
+
+    @app_commands.command(name="balance", description="Check your wallet balances")
+    async def balance(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        uid = str(interaction.user.id)
+        await mc.ensure_user(uid)
+        try:
+            data = await mc.get_balance(uid)
+            await interaction.followup.send(
+                embed=balance_embed(interaction.user.display_name, data),
+                ephemeral=True,
+            )
+        except httpx.HTTPStatusError as e:
+            await interaction.followup.send(
+                embed=error_embed(e.response.json().get("detail", "Unknown error")),
+                ephemeral=True,
+            )
+
+    # ── /transfer ─────────────────────────────────────────────
+
+    @app_commands.command(name="transfer", description="Send currency to another player")
+    @app_commands.describe(
+        recipient="The player to send to",
+        amount="How much to send",
+        currency="Currency ID (e.g. GLD)",
+    )
+    async def transfer(
+        self,
+        interaction: discord.Interaction,
+        recipient: discord.Member,
+        amount: int,
+        currency: str,
+    ):
+        await interaction.response.defer(ephemeral=True)
+
+        if amount <= 0:
+            await interaction.followup.send(
+                embed=error_embed("Amount must be greater than 0"), ephemeral=True)
+            return
+
+        if recipient.id == interaction.user.id:
+            await interaction.followup.send(
+                embed=error_embed("You can't transfer to yourself"), ephemeral=True)
+            return
+
+        from_uid = str(interaction.user.id)
+        to_uid   = str(recipient.id)
+
+        await mc.ensure_user(from_uid)
+        await mc.ensure_user(to_uid)
+
+        try:
+            data = await mc.transfer(from_uid, to_uid, amount, currency.upper())
+            await interaction.followup.send(
+                embed=transfer_embed(
+                    interaction.user.display_name, recipient.display_name,
+                    amount, currency.upper(), data["from_balance"],
+                ),
+                ephemeral=True,
+            )
+        except httpx.HTTPStatusError as e:
+            detail = e.response.json().get("detail", "Transfer failed")
+            msgs   = {
+                "DEBT_LIMIT_EXCEEDED": "You've hit your debt limit.",
+                "User not found":      "Recipient account error — try again.",
+            }
+            await interaction.followup.send(
+                embed=error_embed(msgs.get(detail, detail)), ephemeral=True)
+
+    # ── /loan ─────────────────────────────────────────────────
+
+    @app_commands.command(name="loan", description="Take a loan from the treasury")
+    @app_commands.describe(
+        amount="How much to borrow",
+        currency="Currency ID (e.g. GLD)",
+    )
+    async def loan(self, interaction: discord.Interaction, amount: int, currency: str):
+        await interaction.response.defer(ephemeral=True)
+
+        if amount <= 0:
+            await interaction.followup.send(
+                embed=error_embed("Amount must be greater than 0"), ephemeral=True)
+            return
+
+        uid = str(interaction.user.id)
+        await mc.ensure_user(uid)
+
+        try:
+            data = await mc.take_loan(uid, amount, currency.upper())
+            await interaction.followup.send(
+                embed=loan_embed(
+                    interaction.user.display_name, amount,
+                    currency.upper(), data["debt"],
+                ),
+                ephemeral=True,
+            )
+        except httpx.HTTPStatusError as e:
+            await interaction.followup.send(
+                embed=error_embed(e.response.json().get("detail", "Loan failed")),
+                ephemeral=True,
+            )
+
+    # ── /repay ────────────────────────────────────────────────
+
+    @app_commands.command(name="repay", description="Repay your outstanding loan")
+    @app_commands.describe(
+        amount="How much to repay",
+        currency="Currency ID (e.g. GLD)",
+    )
+    async def repay(self, interaction: discord.Interaction, amount: int, currency: str):
+        await interaction.response.defer(ephemeral=True)
+
+        uid = str(interaction.user.id)
+        await mc.ensure_user(uid)
+
+        try:
+            data = await mc.repay_loan(uid, amount, currency.upper())
+            await interaction.followup.send(
+                embed=repay_embed(
+                    interaction.user.display_name,
+                    data["repaid_amount"], currency.upper(),
+                    data["remaining_debt"], data["excess_ignored"],
+                ),
+                ephemeral=True,
+            )
+        except httpx.HTTPStatusError as e:
+            detail = e.response.json().get("detail", "Repay failed")
+            msgs   = {
+                "INSUFFICIENT_FUNDS": "You don't have enough funds to repay that amount.",
+                "NO_DEBT_TO_REPAY":   "You have no outstanding debt.",
+            }
+            await interaction.followup.send(
+                embed=error_embed(msgs.get(detail, detail)), ephemeral=True)
+
+    # ── /ledger ───────────────────────────────────────────────
+
+    @app_commands.command(name="ledger", description="View your last 10 transactions")
+    async def ledger(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        uid = str(interaction.user.id)
+        await mc.ensure_user(uid)
+
+        try:
+            txs = await mc.get_ledger(uid)
+            await interaction.followup.send(
+                embed=ledger_embed(interaction.user.display_name, txs),
+                ephemeral=True,
+            )
+        except httpx.HTTPStatusError as e:
+            await interaction.followup.send(
+                embed=error_embed(e.response.json().get("detail", "Error")),
+                ephemeral=True,
+            )
+
+    # ── /rate ─────────────────────────────────────────────────
+
+    @app_commands.command(name="rate", description="Check an exchange rate")
+    @app_commands.describe(
+        base="Base currency (e.g. USD)",
+        target="Target currency (e.g. EUR)",
+    )
+    async def rate(self, interaction: discord.Interaction, base: str, target: str):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            data = await mc.get_rate(base.upper(), target.upper())
+            await interaction.followup.send(
+                embed=rate_embed(base.upper(), target.upper(),
+                                 data["rate"], data["source"]),
+                ephemeral=True,
+            )
+        except httpx.HTTPStatusError:
+            await interaction.followup.send(
+                embed=error_embed(f"No rate found for {base.upper()}/{target.upper()}"),
+                ephemeral=True,
+            )
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(PlayerCog(bot))
+---
+
+# ============================================================
+# bot/cogs/admin.py  — admin slash commands (role-gated)
+# ============================================================
+
+make-file "bot/cogs/admin.py" with ---
+"""
+Admin commands — only usable by members with the ADMIN_ROLE_NAME role.
+Commands are visible to everyone but bounce non-admins with an ephemeral error.
+"""
+import os
+import discord
+from discord import app_commands
+from discord.ext import commands
+from dotenv import load_dotenv
+import httpx
+
+from bot import client as mc
+from bot.embeds import (
+    mint_embed, burn_embed, tax_embed, stats_embed,
+    richlist_embed, interest_embed, error_embed,
+)
+
+load_dotenv()
+ADMIN_ROLE = os.getenv("ADMIN_ROLE_NAME", "MintAdmin")
+
+def is_admin(interaction: discord.Interaction) -> bool:
+    role_names = [r.name for r in interaction.user.roles]
+    return ADMIN_ROLE in role_names
+
+async def _deny(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        embed=error_embed(f"You need the **{ADMIN_ROLE}** role to use this command."),
+        ephemeral=True,
+    )
+
+class AdminCog(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+
+    # ── /admin mint ───────────────────────────────────────────
+
+    @app_commands.command(name="admin-mint", description="[Admin] Mint currency to a user")
+    @app_commands.describe(
+        recipient="Target Discord member",
+        amount="Amount to mint",
+        currency="Currency ID",
+    )
+    async def admin_mint(
+        self,
+        interaction: discord.Interaction,
+        recipient: discord.Member,
+        amount: int,
+        currency: str,
+    ):
+        if not is_admin(interaction):
+            return await _deny(interaction)
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await mc.ensure_user(str(recipient.id))
+            await mc.admin_mint(str(recipient.id), amount, currency.upper())
+            await interaction.followup.send(
+                embed=mint_embed(recipient.display_name, amount, currency.upper()),
+                ephemeral=True,
+            )
+        except httpx.HTTPStatusError as e:
+            await interaction.followup.send(
+                embed=error_embed(e.response.json().get("detail", "Mint failed")),
+                ephemeral=True,
+            )
+
+    # ── /admin burn ───────────────────────────────────────────
+
+    @app_commands.command(name="admin-burn", description="[Admin] Burn currency from a user")
+    @app_commands.describe(
+        target="Target Discord member",
+        amount="Amount to burn",
+        currency="Currency ID",
+    )
+    async def admin_burn(
+        self,
+        interaction: discord.Interaction,
+        target: discord.Member,
+        amount: int,
+        currency: str,
+    ):
+        if not is_admin(interaction):
+            return await _deny(interaction)
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await mc.admin_burn(str(target.id), amount, currency.upper())
+            await interaction.followup.send(
+                embed=burn_embed(target.display_name, amount, currency.upper()),
+                ephemeral=True,
+            )
+        except httpx.HTTPStatusError as e:
+            await interaction.followup.send(
+                embed=error_embed(e.response.json().get("detail", "Burn failed")),
+                ephemeral=True,
+            )
+
+    # ── /admin tax ────────────────────────────────────────────
+
+    @app_commands.command(name="admin-tax", description="[Admin] Apply a tax sweep")
+    @app_commands.describe(
+        percentage="Tax percentage (1–100)",
+        currency="Currency ID",
+    )
+    async def admin_tax(
+        self,
+        interaction: discord.Interaction,
+        percentage: int,
+        currency: str,
+    ):
+        if not is_admin(interaction):
+            return await _deny(interaction)
+        await interaction.response.defer(ephemeral=True)
+        try:
+            data = await mc.admin_tax(percentage, currency.upper())
+            await interaction.followup.send(
+                embed=tax_embed(percentage, currency.upper(), data["total_collected"]),
+                ephemeral=True,
+            )
+        except httpx.HTTPStatusError as e:
+            await interaction.followup.send(
+                embed=error_embed(e.response.json().get("detail", "Tax failed")),
+                ephemeral=True,
+            )
+
+    # ── /admin interest ───────────────────────────────────────
+
+    @app_commands.command(name="admin-interest", description="[Admin] Apply interest to all debts")
+    async def admin_interest(self, interaction: discord.Interaction):
+        if not is_admin(interaction):
+            return await _deny(interaction)
+        await interaction.response.defer(ephemeral=True)
+        try:
+            data = await mc.admin_apply_interest()
+            await interaction.followup.send(
+                embed=interest_embed(data["rate"], data["total_charged"]),
+                ephemeral=True,
+            )
+        except httpx.HTTPStatusError as e:
+            await interaction.followup.send(
+                embed=error_embed(e.response.json().get("detail", "Interest failed")),
+                ephemeral=True,
+            )
+
+    # ── /admin currency ───────────────────────────────────────
+
+    @app_commands.command(name="admin-currency", description="[Admin] Create a new currency")
+    @app_commands.describe(
+        currency_id="Short ID (e.g. GLD)",
+        name="Full name (e.g. Gold)",
+        symbol="Symbol (e.g. G)",
+        supply_cap="Max supply (0 = unlimited)",
+    )
+    async def admin_currency(
+        self,
+        interaction: discord.Interaction,
+        currency_id: str,
+        name: str,
+        symbol: str,
+        supply_cap: int = 0,
+    ):
+        if not is_admin(interaction):
+            return await _deny(interaction)
+        await interaction.response.defer(ephemeral=True)
+        cap = supply_cap if supply_cap > 0 else None
+        try:
+            await mc.admin_create_currency(currency_id.upper(), name, symbol, cap)
+            e = discord.Embed(
+                title="✅ Currency Created",
+                color=0x2ECC71,
+            )
+            e.add_field(name="ID",     value=f"`{currency_id.upper()}`", inline=True)
+            e.add_field(name="Name",   value=f"`{name}`",                inline=True)
+            e.add_field(name="Symbol", value=f"`{symbol}`",              inline=True)
+            e.add_field(name="Supply cap",
+                        value=f"`{supply_cap:,}`" if cap else "`Unlimited`",
+                        inline=True)
+            await interaction.followup.send(embed=e, ephemeral=True)
+        except httpx.HTTPStatusError as e:
+            await interaction.followup.send(
+                embed=error_embed(e.response.json().get("detail", "Failed")),
+                ephemeral=True,
+            )
+
+    # ── /stats ────────────────────────────────────────────────
+
+    @app_commands.command(name="stats", description="Economy-wide stats")
+    async def stats(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        try:
+            data = await mc.get_stats()
+            await interaction.followup.send(embed=stats_embed(data))
+        except httpx.HTTPStatusError as e:
+            await interaction.followup.send(
+                embed=error_embed(e.response.json().get("detail", "Error")),
+                ephemeral=True,
+            )
+
+    # ── /richlist ─────────────────────────────────────────────
+
+    @app_commands.command(name="richlist", description="Top holders for a currency")
+    @app_commands.describe(currency="Currency ID", limit="How many to show (max 10)")
+    async def richlist(self, interaction: discord.Interaction,
+                       currency: str, limit: int = 10):
+        await interaction.response.defer()
+        try:
+            data = await mc.get_richlist(currency.upper(), min(limit, 10))
+            await interaction.followup.send(
+                embed=richlist_embed(currency.upper(), data["richlist"])
+            )
+        except httpx.HTTPStatusError as e:
+            await interaction.followup.send(
+                embed=error_embed(e.response.json().get("detail", "Error")),
+                ephemeral=True,
+            )
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(AdminCog(bot))
+---
+
+# ============================================================
+# bot/main.py  — bot entrypoint
+# ============================================================
+
+make-file "bot/main.py" with ---
+import os
+import asyncio
+import discord
+from discord.ext import commands
+from dotenv import load_dotenv
+from bot.client import close_client
+
+load_dotenv()
+
+TOKEN = os.getenv("DISCORD_TOKEN")
+if not TOKEN:
+    raise RuntimeError("DISCORD_TOKEN not set in .env")
+
+intents          = discord.Intents.default()
+intents.members  = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+COGS = [
+    "bot.cogs.player",
+    "bot.cogs.admin",
+]
+
+@bot.event
+async def on_ready():
+    await bot.tree.sync()
+    print(f"[MintCore Bot] Logged in as {bot.user} — slash commands synced.")
+
+@bot.event
+async def on_disconnect():
+    await close_client()
+
+async def main():
+    async with bot:
+        for cog in COGS:
+            await bot.load_extension(cog)
+        await bot.start(TOKEN)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+---
+
+# ============================================================
+# README update — append bot section
+# ============================================================
+
+append-file "README.md" with ---
+
+## Discord Bot
+
+### Setup
+
+1. Create a bot at https://discord.com/developers/applications
+2. Enable **Server Members Intent** under Bot settings
+3. Copy your token into `.env`
+4. Invite the bot with `applications.commands` + `bot` scopes
+
+```bash
+# Install deps (includes discord.py)
+pip install -r requirements.txt
+
+# Start MintCore API first
+uvicorn main:app --reload
+
+# Then start the bot (from the mintcore/ folder)
+python -m bot.main
+```
+
+### Player commands
+
+| Command | Description |
+|---|---|
+| `/balance` | Your wallet balances (private) |
+| `/transfer @user amount currency` | Send currency to another player |
+| `/loan amount currency` | Borrow from the treasury |
+| `/repay amount currency` | Pay back your debt |
+| `/ledger` | Your last 10 transactions (private) |
+| `/rate USD EUR` | Check an exchange rate |
+
+### Admin commands (requires MintAdmin role)
+
+| Command | Description |
+|---|---|
+| `/admin-mint @user amount currency` | Mint new currency |
+| `/admin-burn @user amount currency` | Destroy currency |
+| `/admin-tax percentage currency` | Tax sweep all holders |
+| `/admin-interest` | Apply interest to all debts |
+| `/admin-currency id name symbol` | Create a new currency |
+| `/stats` | Economy snapshot (public) |
+| `/richlist currency` | Top holders (public) |
+---
+
+print ""
+print "Discord bot scaffold complete!"
+print ""
+print "  1. Fill in .env with your DISCORD_TOKEN"
+print "  2. pip install -r requirements.txt"
+print "  3. uvicorn main:app --reload   (start API)"
+print "  4. python -m bot.main          (start bot)"
+print ""

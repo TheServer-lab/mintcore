@@ -1,0 +1,961 @@
+# ============================================================
+# MintCore v1.0 — Centralized Virtual Currency Engine
+# Run: bytecraft mintcore.bc
+# ============================================================
+
+strict on
+
+set project "mintcore"
+set version "1.0.0"
+
+print "Scaffolding MintCore {{version}}..."
+
+set-working-folder "{{project}}"
+
+# ── Folder structure ─────────────────────────────────────────
+make-folder "routers"
+make-folder "tests"
+
+# ============================================================
+# requirements.txt
+# ============================================================
+
+make-file "requirements.txt" with ---
+fastapi
+uvicorn[standard]
+sqlalchemy
+pydantic
+httpx
+rich
+typer
+---
+
+# ============================================================
+# config.py
+# ============================================================
+
+make-file "config.py" with ---
+ADMIN_KEY     = "admin-secret"   # change before prod
+TREASURY_ID   = "treasury"
+INTEREST_RATE = 5                # % per interest cycle
+DEBT_CAP      = -1000            # max overdraft allowed
+DATABASE_URL  = "sqlite:///./mintcore.db"
+CACHE_TTL     = 300              # seconds for live rate cache
+LIVE_RATE_URL = "https://open.er-api.com/v6/latest/{base}"
+---
+
+# ============================================================
+# database.py
+# ============================================================
+
+make-file "database.py" with ---
+from contextlib import contextmanager
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base
+from config import DATABASE_URL
+
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine)
+Base = declarative_base()
+
+@contextmanager
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+---
+
+# ============================================================
+# models.py
+# ============================================================
+
+make-file "models.py" with ---
+import uuid
+from sqlalchemy import Column, String, Integer, Float, DateTime
+from sqlalchemy.sql import func
+from database import Base
+
+def _uuid():
+    return str(uuid.uuid4())
+
+class User(Base):
+    __tablename__ = "users"
+    user_id = Column(String,  primary_key=True)
+    debt    = Column(Integer, default=0)
+
+class Currency(Base):
+    __tablename__ = "currencies"
+    currency_id = Column(String,  primary_key=True)
+    name        = Column(String,  nullable=False)
+    symbol      = Column(String,  nullable=False)
+    supply_cap  = Column(Integer, nullable=True)   # None = unlimited
+
+class Wallet(Base):
+    __tablename__ = "wallets"
+    id          = Column(String,  primary_key=True, default=_uuid)
+    user_id     = Column(String,  nullable=False)
+    currency_id = Column(String,  nullable=False)
+    balance     = Column(Integer, default=0)
+
+class ExchangeRate(Base):
+    __tablename__ = "exchange_rates"
+    id              = Column(String,   primary_key=True, default=_uuid)
+    base_currency   = Column(String,   nullable=False)
+    target_currency = Column(String,   nullable=False)
+    rate            = Column(Float,    nullable=False)
+    updated_at      = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+class Transaction(Base):
+    __tablename__ = "transactions"
+    tx_id       = Column(String,   primary_key=True, default=_uuid)
+    type        = Column(String,   nullable=False)
+    currency_id = Column(String,   nullable=True)
+    from_user   = Column(String,   nullable=False)
+    to_user     = Column(String,   nullable=False)
+    amount      = Column(Integer,  nullable=False)
+    timestamp   = Column(DateTime, server_default=func.now())
+---
+
+# ============================================================
+# schemas.py
+# ============================================================
+
+make-file "schemas.py" with ---
+from pydantic import BaseModel, Field
+from typing import Optional
+
+class CreateUser(BaseModel):
+    user_id: str
+
+class CreateCurrency(BaseModel):
+    currency_id: str
+    name:        str
+    symbol:      str
+    supply_cap:  Optional[int] = None
+
+class SetRate(BaseModel):
+    base:   str
+    target: str
+    rate:   float = Field(gt=0)
+
+class Mint(BaseModel):
+    to:          str
+    amount:      int = Field(gt=0)
+    currency_id: str
+
+class Burn(BaseModel):
+    from_user:   str
+    amount:      int = Field(gt=0)
+    currency_id: str
+
+class Transfer(BaseModel):
+    from_user:   str
+    to_user:     str
+    amount:      int = Field(gt=0)
+    currency_id: str
+
+class Tax(BaseModel):
+    percentage:  int = Field(gt=0, le=100)
+    currency_id: str
+
+class Loan(BaseModel):
+    user_id:     str
+    amount:      int = Field(gt=0)
+    currency_id: str
+
+class Repay(BaseModel):
+    user_id:     str
+    amount:      int = Field(gt=0)
+    currency_id: str
+---
+
+# ============================================================
+# helpers.py
+# ============================================================
+
+make-file "helpers.py" with ---
+import uuid
+from models import Wallet, Transaction
+
+def get_or_create_wallet(db, user_id: str, currency_id: str) -> Wallet:
+    wallet = db.query(Wallet).filter_by(user_id=user_id, currency_id=currency_id).first()
+    if not wallet:
+        wallet = Wallet(user_id=user_id, currency_id=currency_id, balance=0)
+        db.add(wallet)
+        db.flush()
+    return wallet
+
+def log_tx(db, type: str, currency_id, from_user: str, to_user: str, amount: int):
+    db.add(Transaction(
+        tx_id       = str(uuid.uuid4()),
+        type        = type,
+        currency_id = currency_id,
+        from_user   = from_user,
+        to_user     = to_user,
+        amount      = amount,
+    ))
+---
+
+# ============================================================
+# routers/__init__.py
+# ============================================================
+
+make-file "routers/__init__.py" with ""
+
+# ============================================================
+# routers/users.py
+# ============================================================
+
+make-file "routers/users.py" with ---
+from fastapi import APIRouter, HTTPException
+from database import get_db
+from models import User, Wallet
+from schemas import CreateUser
+
+router = APIRouter(prefix="/users", tags=["users"])
+
+@router.post("")
+def create_user(data: CreateUser):
+    with get_db() as db:
+        if db.query(User).filter_by(user_id=data.user_id).first():
+            raise HTTPException(400, "User already exists")
+        db.add(User(user_id=data.user_id))
+        db.commit()
+    return {"status": "created", "user_id": data.user_id}
+
+@router.get("")
+def list_users():
+    with get_db() as db:
+        users = db.query(User).all()
+        return [{"user_id": u.user_id, "debt": u.debt} for u in users]
+
+@router.get("/{user_id}/balance")
+def get_balance(user_id: str):
+    with get_db() as db:
+        user = db.query(User).filter_by(user_id=user_id).first()
+        if not user:
+            raise HTTPException(404, "User not found")
+        wallets = db.query(Wallet).filter_by(user_id=user_id).all()
+        return {
+            "user_id": user_id,
+            "debt":    user.debt,
+            "wallets": {w.currency_id: w.balance for w in wallets},
+        }
+---
+
+# ============================================================
+# routers/transactions.py
+# ============================================================
+
+make-file "routers/transactions.py" with ---
+from fastapi import APIRouter, HTTPException
+from database import get_db
+from models import User, Transaction
+from schemas import Transfer, Repay
+from config import DEBT_CAP, TREASURY_ID
+from helpers import get_or_create_wallet, log_tx
+
+router = APIRouter(tags=["transactions"])
+
+@router.post("/transactions/transfer")
+def transfer(data: Transfer):
+    with get_db() as db:
+        sender   = db.query(User).filter_by(user_id=data.from_user).first()
+        receiver = db.query(User).filter_by(user_id=data.to_user).first()
+        if not sender or not receiver:
+            raise HTTPException(404, "User not found")
+
+        sw = get_or_create_wallet(db, data.from_user, data.currency_id)
+        rw = get_or_create_wallet(db, data.to_user,   data.currency_id)
+
+        if sw.balance - data.amount < DEBT_CAP:
+            raise HTTPException(400, "DEBT_LIMIT_EXCEEDED")
+
+        sw.balance -= data.amount
+        rw.balance += data.amount
+
+        if sw.balance < 0:
+            sender.debt = abs(sw.balance)
+
+        log_tx(db, "transfer", data.currency_id, data.from_user, data.to_user, data.amount)
+        db.commit()
+
+    return {"status": "success", "from_balance": sw.balance, "to_balance": rw.balance}
+
+@router.post("/repay")
+def repay_loan(data: Repay):
+    with get_db() as db:
+        user = db.query(User).filter_by(user_id=data.user_id).first()
+        if not user:
+            raise HTTPException(404, "User not found")
+
+        wallet = get_or_create_wallet(db, data.user_id, data.currency_id)
+        if wallet.balance < data.amount:
+            raise HTTPException(400, "INSUFFICIENT_FUNDS")
+
+        repay_amount = min(data.amount, user.debt)
+        if repay_amount == 0:
+            raise HTTPException(400, "NO_DEBT_TO_REPAY")
+
+        treasury_w         = get_or_create_wallet(db, TREASURY_ID, data.currency_id)
+        wallet.balance    -= repay_amount
+        user.debt         -= repay_amount
+        treasury_w.balance += repay_amount
+
+        log_tx(db, "repay", data.currency_id, data.user_id, TREASURY_ID, repay_amount)
+        db.commit()
+
+    return {
+        "status":         "repaid",
+        "repaid_amount":  repay_amount,
+        "remaining_debt": user.debt,
+        "excess_ignored": data.amount - repay_amount,
+    }
+
+@router.get("/ledger")
+def get_ledger():
+    with get_db() as db:
+        txs = db.query(Transaction).order_by(Transaction.timestamp.desc()).all()
+        return [_tx_dict(t) for t in txs]
+
+@router.get("/ledger/{user_id}")
+def get_user_ledger(user_id: str):
+    with get_db() as db:
+        txs = db.query(Transaction).filter(
+            (Transaction.from_user == user_id) | (Transaction.to_user == user_id)
+        ).order_by(Transaction.timestamp.desc()).all()
+        return [_tx_dict(t) for t in txs]
+
+def _tx_dict(t):
+    return {
+        "tx_id":       t.tx_id,
+        "type":        t.type,
+        "currency_id": t.currency_id,
+        "from_user":   t.from_user,
+        "to_user":     t.to_user,
+        "amount":      t.amount,
+        "timestamp":   str(t.timestamp),
+    }
+---
+
+# ============================================================
+# routers/admin.py
+# ============================================================
+
+make-file "routers/admin.py" with ---
+from fastapi import APIRouter, HTTPException, Header
+from sqlalchemy import func
+from database import get_db
+from models import User, Currency, Wallet, ExchangeRate
+from schemas import CreateCurrency, Mint, Burn, Tax, Loan, SetRate
+from config import ADMIN_KEY, TREASURY_ID, INTEREST_RATE
+from helpers import get_or_create_wallet, log_tx
+
+router = APIRouter(prefix="/admin", tags=["admin"])
+
+def _auth(key: str):
+    if key != ADMIN_KEY:
+        raise HTTPException(403, "Unauthorized")
+
+@router.post("/currency")
+def create_currency(data: CreateCurrency, x_admin_key: str = Header(None)):
+    _auth(x_admin_key)
+    with get_db() as db:
+        if db.query(Currency).filter_by(currency_id=data.currency_id).first():
+            raise HTTPException(400, "Currency already exists")
+        db.add(Currency(**data.model_dump()))
+        db.commit()
+    return {"status": "currency_created", "currency_id": data.currency_id}
+
+@router.get("/currency")
+def list_currencies(x_admin_key: str = Header(None)):
+    _auth(x_admin_key)
+    with get_db() as db:
+        rows = db.query(Currency).all()
+        return [
+            {"currency_id": c.currency_id, "name": c.name,
+             "symbol": c.symbol, "supply_cap": c.supply_cap}
+            for c in rows
+        ]
+
+@router.post("/rates")
+def set_rate(data: SetRate, x_admin_key: str = Header(None)):
+    _auth(x_admin_key)
+    with get_db() as db:
+        existing = db.query(ExchangeRate).filter_by(
+            base_currency=data.base, target_currency=data.target
+        ).first()
+        if existing:
+            existing.rate = data.rate
+        else:
+            db.add(ExchangeRate(
+                base_currency=data.base,
+                target_currency=data.target,
+                rate=data.rate,
+            ))
+        db.commit()
+    return {"status": "rate_set", "pair": f"{data.base}/{data.target}", "rate": data.rate}
+
+@router.post("/mint")
+def mint(data: Mint, x_admin_key: str = Header(None)):
+    _auth(x_admin_key)
+    with get_db() as db:
+        cur = db.query(Currency).filter_by(currency_id=data.currency_id).first()
+        if not cur:
+            raise HTTPException(404, "Currency not found")
+        if cur.supply_cap is not None:
+            total = db.query(func.sum(Wallet.balance)).filter_by(
+                currency_id=data.currency_id).scalar() or 0
+            if total + data.amount > cur.supply_cap:
+                raise HTTPException(400, "SUPPLY_CAP_EXCEEDED")
+        if not db.query(User).filter_by(user_id=data.to).first():
+            db.add(User(user_id=data.to))
+        wallet = get_or_create_wallet(db, data.to, data.currency_id)
+        wallet.balance += data.amount
+        log_tx(db, "mint", data.currency_id, "system", data.to, data.amount)
+        db.commit()
+    return {"status": "minted", "to": data.to,
+            "amount": data.amount, "currency": data.currency_id}
+
+@router.post("/burn")
+def burn(data: Burn, x_admin_key: str = Header(None)):
+    _auth(x_admin_key)
+    with get_db() as db:
+        wallet = get_or_create_wallet(db, data.from_user, data.currency_id)
+        if wallet.balance < data.amount:
+            raise HTTPException(400, "INSUFFICIENT_BALANCE_TO_BURN")
+        wallet.balance -= data.amount
+        log_tx(db, "burn", data.currency_id, data.from_user, "system", data.amount)
+        db.commit()
+    return {"status": "burned", "amount": data.amount}
+
+@router.post("/tax")
+def apply_tax(data: Tax, x_admin_key: str = Header(None)):
+    _auth(x_admin_key)
+    collected = 0
+    with get_db() as db:
+        treasury = get_or_create_wallet(db, TREASURY_ID, data.currency_id)
+        wallets  = db.query(Wallet).filter(
+            Wallet.currency_id == data.currency_id,
+            Wallet.user_id    != TREASURY_ID,
+            Wallet.balance     > 0,
+        ).all()
+        for w in wallets:
+            tax = int(w.balance * (data.percentage / 100))
+            if tax == 0:
+                continue
+            w.balance        -= tax
+            treasury.balance += tax
+            collected        += tax
+            log_tx(db, "tax", data.currency_id, w.user_id, TREASURY_ID, tax)
+        db.commit()
+    return {"status": "tax_applied", "rate": data.percentage,
+            "currency": data.currency_id, "total_collected": collected}
+
+@router.post("/loan")
+def give_loan(data: Loan, x_admin_key: str = Header(None)):
+    _auth(x_admin_key)
+    with get_db() as db:
+        user = db.query(User).filter_by(user_id=data.user_id).first()
+        if not user:
+            raise HTTPException(404, "User not found")
+        treasury = get_or_create_wallet(db, TREASURY_ID, data.currency_id)
+        wallet   = get_or_create_wallet(db, data.user_id, data.currency_id)
+        user.debt              += data.amount
+        wallet.balance         += data.amount
+        treasury.balance       -= data.amount
+        log_tx(db, "loan", data.currency_id, TREASURY_ID, data.user_id, data.amount)
+        db.commit()
+    return {"status": "loan_given", "debt": user.debt}
+
+@router.post("/apply-interest")
+def apply_interest(x_admin_key: str = Header(None)):
+    _auth(x_admin_key)
+    total_interest = 0
+    with get_db() as db:
+        users = db.query(User).filter(User.debt > 0).all()
+        for user in users:
+            interest = int(user.debt * (INTEREST_RATE / 100))
+            if interest == 0:
+                continue
+            user.debt      += interest
+            total_interest += interest
+            log_tx(db, "interest", None, user.user_id, TREASURY_ID, interest)
+        db.commit()
+    return {"status": "interest_applied",
+            "rate": INTEREST_RATE, "total_charged": total_interest}
+---
+
+# ============================================================
+# routers/rates.py
+# ============================================================
+
+make-file "routers/rates.py" with ---
+import time
+import httpx
+from fastapi import APIRouter, HTTPException
+from database import get_db
+from models import ExchangeRate
+from config import CACHE_TTL, LIVE_RATE_URL
+
+router = APIRouter(prefix="/rate", tags=["rates"])
+
+_cache: dict = {}
+
+async def fetch_live_rate(base: str, target: str):
+    key = f"{base}_{target}"
+    now = time.time()
+    if key in _cache and now - _cache[key]["time"] < CACHE_TTL:
+        return _cache[key]["rate"], "cache"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            res  = await client.get(LIVE_RATE_URL.format(base=base))
+            res.raise_for_status()
+            data = res.json()
+            rate = data["rates"].get(target)
+            if rate is None:
+                return None, None
+            _cache[key] = {"rate": rate, "time": now}
+            return rate, "live"
+    except (httpx.RequestError, httpx.HTTPStatusError, KeyError) as e:
+        print(f"[rate fetch error] {base}/{target}: {e}")
+        return None, None
+
+@router.get("/{base}/{target}")
+async def get_rate(base: str, target: str):
+    rate, source = await fetch_live_rate(base.upper(), target.upper())
+    if rate:
+        return {"base": base, "target": target, "rate": rate, "source": source}
+    with get_db() as db:
+        stored = db.query(ExchangeRate).filter_by(
+            base_currency=base.upper(), target_currency=target.upper()
+        ).first()
+        if stored:
+            return {"base": base, "target": target,
+                    "rate": stored.rate, "source": "stored"}
+    raise HTTPException(404, "Rate not found — set one via /admin/rates")
+---
+
+# ============================================================
+# routers/analytics.py
+# ============================================================
+
+make-file "routers/analytics.py" with ---
+from fastapi import APIRouter
+from sqlalchemy import func
+from database import get_db
+from models import Wallet, Transaction, User
+from datetime import datetime, timedelta
+
+router = APIRouter(prefix="/analytics", tags=["analytics"])
+
+@router.get("/supply")
+def supply_by_currency():
+    """Total circulating supply per currency."""
+    with get_db() as db:
+        rows = (
+            db.query(Wallet.currency_id, func.sum(Wallet.balance))
+            .group_by(Wallet.currency_id)
+            .all()
+        )
+        return {"supply": {cid: total for cid, total in rows}}
+
+@router.get("/velocity")
+def transaction_velocity(hours: int = 24):
+    """Transaction volume in last N hours, per currency."""
+    since = datetime.utcnow() - timedelta(hours=hours)
+    with get_db() as db:
+        rows = (
+            db.query(Transaction.currency_id,
+                     func.sum(Transaction.amount),
+                     func.count())
+            .filter(Transaction.timestamp >= since)
+            .group_by(Transaction.currency_id)
+            .all()
+        )
+        return {
+            "window_hours": hours,
+            "velocity": {
+                cid: {"volume": vol, "tx_count": count}
+                for cid, vol, count in rows
+                if cid is not None
+            },
+        }
+
+@router.get("/richlist/{currency_id}")
+def richlist(currency_id: str, limit: int = 10):
+    """Top N holders for a given currency."""
+    with get_db() as db:
+        rows = (
+            db.query(Wallet.user_id, Wallet.balance)
+            .filter(Wallet.currency_id == currency_id,
+                    Wallet.user_id != "treasury")
+            .order_by(Wallet.balance.desc())
+            .limit(limit)
+            .all()
+        )
+        return {
+            "currency_id": currency_id,
+            "richlist": [{"user_id": uid, "balance": bal} for uid, bal in rows],
+        }
+
+@router.get("/debt")
+def debt_overview():
+    """Users with outstanding debt, sorted highest first."""
+    with get_db() as db:
+        users = (
+            db.query(User)
+            .filter(User.debt > 0)
+            .order_by(User.debt.desc())
+            .all()
+        )
+        return {
+            "total_debt": sum(u.debt for u in users),
+            "debtors": [{"user_id": u.user_id, "debt": u.debt} for u in users],
+        }
+
+@router.get("/stats")
+def global_stats():
+    """High-level economy snapshot."""
+    with get_db() as db:
+        user_count  = db.query(User).count()
+        total_debt  = db.query(func.sum(User.debt)).scalar() or 0
+        tx_count    = db.query(Transaction).count()
+        supply_rows = (
+            db.query(Wallet.currency_id, func.sum(Wallet.balance))
+            .group_by(Wallet.currency_id)
+            .all()
+        )
+        return {
+            "user_count":          user_count,
+            "total_debt":          total_debt,
+            "total_tx":            tx_count,
+            "supply_by_currency":  {cid: total for cid, total in supply_rows},
+        }
+---
+
+# ============================================================
+# main.py
+# ============================================================
+
+make-file "main.py" with ---
+from fastapi import FastAPI
+from database import Base, engine, SessionLocal
+from models import User
+from config import TREASURY_ID
+from routers import users, transactions, admin, rates, analytics
+
+app = FastAPI(
+    title="MintCore",
+    description="Centralized virtual currency engine",
+    version="1.0.0",
+)
+
+Base.metadata.create_all(bind=engine)
+
+with SessionLocal() as db:
+    if not db.query(User).filter_by(user_id=TREASURY_ID).first():
+        db.add(User(user_id=TREASURY_ID))
+        db.commit()
+
+app.include_router(users.router)
+app.include_router(transactions.router)
+app.include_router(admin.router)
+app.include_router(rates.router)
+app.include_router(analytics.router)
+
+@app.get("/", tags=["root"])
+def root():
+    return {"engine": "MintCore", "version": "1.0.0", "docs": "/docs"}
+---
+
+# ============================================================
+# cli.py  (Typer + Rich admin CLI)
+# ============================================================
+
+make-file "cli.py" with ---
+import typer
+import requests
+from rich.console import Console
+from rich.table import Table
+
+app     = typer.Typer(help="MintCore admin CLI")
+console = Console()
+
+BASE    = "http://127.0.0.1:8000"
+KEY     = "admin-secret"
+HEADERS = {"X-Admin-Key": KEY}
+
+def _post(path, payload):
+    r = requests.post(f"{BASE}{path}", json=payload, headers=HEADERS)
+    return r.json()
+
+def _get(path):
+    r = requests.get(f"{BASE}{path}", headers=HEADERS)
+    return r.json()
+
+@app.command()
+def create_user(user_id: str):
+    """Create a new player account."""
+    r = requests.post(f"{BASE}/users", json={"user_id": user_id})
+    console.print(r.json())
+
+@app.command()
+def users():
+    """List all users."""
+    data = _get("/users")
+    t = Table("user_id", "debt")
+    for u in data:
+        t.add_row(u["user_id"], str(u["debt"]))
+    console.print(t)
+
+@app.command()
+def balance(user_id: str):
+    """Show wallet balances for a user."""
+    console.print(_get(f"/users/{user_id}/balance"))
+
+@app.command()
+def create_currency(currency_id: str, name: str, symbol: str, supply_cap: int = None):
+    """Define a new virtual currency."""
+    payload = {"currency_id": currency_id, "name": name, "symbol": symbol}
+    if supply_cap:
+        payload["supply_cap"] = supply_cap
+    console.print(_post("/admin/currency", payload))
+
+@app.command()
+def currencies():
+    """List all currencies."""
+    data = _get("/admin/currency")
+    t = Table("currency_id", "name", "symbol", "supply_cap")
+    for c in data:
+        t.add_row(c["currency_id"], c["name"], c["symbol"],
+                  str(c.get("supply_cap") or "unlimited"))
+    console.print(t)
+
+@app.command()
+def mint(to: str, amount: int, currency_id: str):
+    """Mint currency into a user wallet."""
+    console.print(_post("/admin/mint", {"to": to, "amount": amount, "currency_id": currency_id}))
+
+@app.command()
+def burn(from_user: str, amount: int, currency_id: str):
+    """Burn currency from a user wallet."""
+    console.print(_post("/admin/burn", {"from_user": from_user, "amount": amount, "currency_id": currency_id}))
+
+@app.command()
+def transfer(from_user: str, to_user: str, amount: int, currency_id: str):
+    """Transfer currency between users."""
+    r = requests.post(f"{BASE}/transactions/transfer", json={
+        "from_user": from_user, "to_user": to_user,
+        "amount": amount, "currency_id": currency_id,
+    })
+    console.print(r.json())
+
+@app.command()
+def tax(percentage: int, currency_id: str):
+    """Apply a tax sweep across all holders."""
+    console.print(_post("/admin/tax", {"percentage": percentage, "currency_id": currency_id}))
+
+@app.command()
+def loan(user_id: str, amount: int, currency_id: str):
+    """Issue a treasury loan to a user."""
+    console.print(_post("/admin/loan", {"user_id": user_id, "amount": amount, "currency_id": currency_id}))
+
+@app.command()
+def apply_interest():
+    """Apply interest to all outstanding debts."""
+    console.print(_post("/admin/apply-interest", {}))
+
+@app.command()
+def repay(user_id: str, amount: int, currency_id: str):
+    """Repay a loan."""
+    r = requests.post(f"{BASE}/repay", json={
+        "user_id": user_id, "amount": amount, "currency_id": currency_id,
+    })
+    console.print(r.json())
+
+@app.command()
+def ledger(user_id: str = None):
+    """Full ledger, or filtered by user."""
+    path = f"/ledger/{user_id}" if user_id else "/ledger"
+    data = _get(path)
+    t = Table("type", "currency", "from", "to", "amount", "timestamp")
+    for tx in data:
+        t.add_row(
+            tx["type"], tx.get("currency_id") or "-",
+            tx["from_user"], tx["to_user"],
+            str(tx["amount"]), str(tx["timestamp"])[:19],
+        )
+    console.print(t)
+
+@app.command()
+def stats():
+    """Global economy snapshot."""
+    console.print(_get("/analytics/stats"))
+
+@app.command()
+def supply():
+    """Circulating supply per currency."""
+    console.print(_get("/analytics/supply"))
+
+@app.command()
+def richlist(currency_id: str, limit: int = 10):
+    """Top holders for a currency."""
+    data = _get(f"/analytics/richlist/{currency_id}?limit={limit}")
+    t = Table("rank", "user_id", "balance")
+    for i, row in enumerate(data["richlist"], 1):
+        t.add_row(str(i), row["user_id"], str(row["balance"]))
+    console.print(t)
+
+@app.command()
+def rate(base: str, target: str):
+    """Look up an exchange rate."""
+    r = requests.get(f"{BASE}/rate/{base}/{target}")
+    console.print(r.json())
+
+if __name__ == "__main__":
+    app()
+---
+
+# ============================================================
+# tests/__init__.py
+# ============================================================
+
+make-file "tests/__init__.py" with ""
+
+# ============================================================
+# tests/test_engine.py
+# ============================================================
+
+make-file "tests/test_engine.py" with ---
+"""
+Smoke tests for MintCore.  Run with: pytest tests/
+"""
+from fastapi.testclient import TestClient
+from main import app
+
+client  = TestClient(app)
+HEADERS = {"X-Admin-Key": "admin-secret"}
+
+def _post(path, payload, headers=None):
+    return client.post(path, json=payload, headers=headers or {})
+
+def setup_module():
+    _post("/admin/currency", {"currency_id": "GLD", "name": "Gold", "symbol": "G"}, HEADERS)
+    _post("/users", {"user_id": "alice"})
+    _post("/users", {"user_id": "bob"})
+
+def test_mint_and_balance():
+    _post("/admin/mint", {"to": "alice", "amount": 500, "currency_id": "GLD"}, HEADERS)
+    r = client.get("/users/alice/balance")
+    assert r.status_code == 200
+    assert r.json()["wallets"]["GLD"] == 500
+
+def test_transfer():
+    r = _post("/transactions/transfer", {
+        "from_user": "alice", "to_user": "bob",
+        "amount": 100, "currency_id": "GLD",
+    })
+    assert r.status_code == 200
+    assert r.json()["from_balance"] == 400
+
+def test_debt_cap():
+    r = _post("/transactions/transfer", {
+        "from_user": "bob", "to_user": "alice",
+        "amount": 5000, "currency_id": "GLD",
+    })
+    assert r.status_code == 400
+    assert r.json()["detail"] == "DEBT_LIMIT_EXCEEDED"
+
+def test_tax():
+    r = _post("/admin/tax", {"percentage": 10, "currency_id": "GLD"}, HEADERS)
+    assert r.status_code == 200
+    assert r.json()["status"] == "tax_applied"
+
+def test_loan_and_repay():
+    _post("/admin/mint", {"to": "bob", "amount": 300, "currency_id": "GLD"}, HEADERS)
+    _post("/admin/loan", {"user_id": "bob", "amount": 200, "currency_id": "GLD"}, HEADERS)
+    r = client.post("/repay", json={"user_id": "bob", "amount": 200, "currency_id": "GLD"})
+    assert r.status_code == 200
+    assert r.json()["remaining_debt"] == 0
+
+def test_supply_analytics():
+    r = client.get("/analytics/supply")
+    assert "supply" in r.json()
+
+def test_stats():
+    r = client.get("/analytics/stats")
+    body = r.json()
+    assert "user_count" in body
+    assert "total_tx" in body
+---
+
+# ============================================================
+# README.md
+# ============================================================
+
+make-file "README.md" with ---
+# MintCore v1.0
+
+Centralized virtual currency engine — FastAPI + SQLAlchemy + Typer CLI.
+
+## Quickstart
+
+```bash
+pip install -r requirements.txt
+uvicorn main:app --reload
+# API docs: http://127.0.0.1:8000/docs
+```
+
+## CLI usage
+
+```bash
+python cli.py create-currency GLD Gold G --supply-cap 1000000
+python cli.py mint player1 500 GLD
+python cli.py transfer player1 player2 100 GLD
+python cli.py tax 5 GLD
+python cli.py loan player1 200 GLD
+python cli.py apply-interest
+python cli.py richlist GLD
+python cli.py stats
+python cli.py ledger
+python cli.py ledger player1
+```
+
+## Tests
+
+```bash
+pytest tests/
+```
+
+## Layout
+
+```
+mintcore/
+├── main.py              # app entrypoint + startup
+├── config.py            # ADMIN_KEY, DEBT_CAP, etc.
+├── database.py          # engine, SessionLocal, get_db
+├── models.py            # SQLAlchemy ORM
+├── schemas.py           # Pydantic schemas
+├── helpers.py           # get_or_create_wallet, log_tx
+├── cli.py               # Typer + Rich admin CLI
+├── routers/
+│   ├── users.py         # /users
+│   ├── transactions.py  # /transactions/transfer, /repay, /ledger
+│   ├── admin.py         # /admin/* (currency, mint, burn, tax, loan, rates)
+│   ├── rates.py         # /rate/{base}/{target}
+│   └── analytics.py     # /analytics/supply, velocity, richlist, debt, stats
+└── tests/
+    └── test_engine.py
+```
+---
+
+print ""
+print "MintCore {{version}} ready!"
+print ""
+print "  cd {{project}}"
+print "  pip install -r requirements.txt"
+print "  uvicorn main:app --reload"
+print ""
