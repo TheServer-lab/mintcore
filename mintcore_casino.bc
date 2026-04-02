@@ -1,0 +1,657 @@
+# ============================================================
+# MintCore Casino — CLI gambling game
+# Requires MintCore API running on localhost:8000
+# Run: bytecraft mintcore_casino.bc
+# ============================================================
+
+strict on
+
+set project "mintcore-casino"
+
+print "Scaffolding MintCore Casino..."
+
+set-working-folder "{{project}}"
+
+# ============================================================
+# requirements.txt
+# ============================================================
+
+make-file "requirements.txt" with ---
+httpx
+rich
+---
+
+# ============================================================
+# config.py
+# ============================================================
+
+make-file "config.py" with ---
+MINTCORE_URL      = "http://127.0.0.1:8000"
+MINTCORE_ADMIN_KEY = "admin-secret"
+CURRENCY           = "CHIP"
+CURRENCY_NAME      = "Casino Chips"
+CURRENCY_SYMBOL    = "C"
+WELCOME_BONUS      = 100
+HOUSE_ID           = "casino_house"
+ADMIN_HEADERS      = {"X-Admin-Key": MINTCORE_ADMIN_KEY}
+---
+
+# ============================================================
+# api.py  — thin wrapper around MintCore REST API
+# ============================================================
+
+make-file "api.py" with ---
+"""All MintCore API calls in one place."""
+import httpx
+from config import MINTCORE_URL, ADMIN_HEADERS, CURRENCY, HOUSE_ID
+
+_client = httpx.Client(base_url=MINTCORE_URL, timeout=10.0)
+
+def _post(path, json=None, headers=None):
+    r = _client.post(path, json=json, headers=headers or {})
+    return r.json()
+
+def _get(path):
+    r = _client.get(path)
+    return r.json()
+
+def ensure_currency():
+    """Create CHIP currency and house account if they don't exist."""
+    _post("/admin/currency", {
+        "currency_id": CURRENCY,
+        "name":        "Casino Chips",
+        "symbol":      "C",
+    }, ADMIN_HEADERS)
+    ensure_user(HOUSE_ID)
+    # Seed house with a large float so it can always pay winnings
+    bal = get_balance(HOUSE_ID)
+    if bal.get("wallets", {}).get(CURRENCY, 0) < 500_000:
+        _post("/admin/mint", {
+            "to":          HOUSE_ID,
+            "amount":      1_000_000,
+            "currency_id": CURRENCY,
+        }, ADMIN_HEADERS)
+
+def ensure_user(user_id: str) -> dict:
+    return _post("/users", {"user_id": user_id})
+
+def get_balance(user_id: str) -> dict:
+    return _get(f"/users/{user_id}/balance")
+
+def get_chips(user_id: str) -> int:
+    data = get_balance(user_id)
+    return data.get("wallets", {}).get(CURRENCY, 0)
+
+def mint_welcome(user_id: str, amount: int):
+    _post("/admin/mint", {
+        "to":          user_id,
+        "amount":      amount,
+        "currency_id": CURRENCY,
+    }, ADMIN_HEADERS)
+
+def place_bet(player_id: str, amount: int):
+    """Player sends chips to house."""
+    return _post("/transactions/transfer", {
+        "from_user":   player_id,
+        "to_user":     HOUSE_ID,
+        "amount":      amount,
+        "currency_id": CURRENCY,
+    })
+
+def pay_winnings(player_id: str, amount: int):
+    """House sends chips to player."""
+    return _post("/transactions/transfer", {
+        "from_user":   HOUSE_ID,
+        "to_user":     player_id,
+        "amount":      amount,
+        "currency_id": CURRENCY,
+    })
+
+def get_ledger(user_id: str) -> list:
+    return _get(f"/ledger/{user_id}")
+---
+
+# ============================================================
+# games/  folder
+# ============================================================
+
+make-folder "games"
+make-file "games/__init__.py" with ""
+
+# ============================================================
+# games/slots.py
+# ============================================================
+
+make-file "games/slots.py" with ---
+import random
+import time
+from rich.console import Console
+from rich.table import Table
+from rich import box
+
+console = Console()
+
+REELS   = ["🍒", "🍋", "🍊", "🍇", "⭐", "💎", "7️⃣"]
+WEIGHTS = [30,   25,   20,   15,   6,    3,    1  ]
+
+PAYOUTS = {
+    ("💎", "💎", "💎"): 50,
+    ("7️⃣", "7️⃣", "7️⃣"): 25,
+    ("⭐", "⭐", "⭐"): 10,
+    ("🍇", "🍇", "🍇"): 6,
+    ("🍊", "🍊", "🍊"): 4,
+    ("🍋", "🍋", "🍋"): 3,
+    ("🍒", "🍒", "🍒"): 2,
+}
+PARTIAL_CHERRY = 0.5   # multiplier for exactly 2 cherries
+
+def spin() -> list[str]:
+    return random.choices(REELS, weights=WEIGHTS, k=3)
+
+def get_multiplier(reels: list[str]) -> float:
+    combo = tuple(reels)
+    if combo in PAYOUTS:
+        return PAYOUTS[combo]
+    if reels.count("🍒") == 2:
+        return PARTIAL_CHERRY
+    return 0
+
+def animate_spin(console: Console):
+    frames = 12
+    for i in range(frames):
+        interim = random.choices(REELS, weights=WEIGHTS, k=3)
+        console.print(
+            f"  [ {'  '.join(interim)} ]",
+            end="\r", style="bold yellow"
+        )
+        time.sleep(0.07)
+
+def play(player_id: str, bet: int, api) -> dict:
+    from rich.panel import Panel
+
+    chips = api.get_chips(player_id)
+    if chips < bet:
+        console.print(f"[red]Not enough chips! You have {chips} CHIP.[/]")
+        return {"played": False}
+
+    r = api.place_bet(player_id, bet)
+    if "detail" in r:
+        console.print(f"[red]Bet failed: {r['detail']}[/]")
+        return {"played": False}
+
+    console.print("\n[bold yellow]🎰 Spinning...[/]")
+    animate_spin(console)
+
+    reels      = spin()
+    multiplier = get_multiplier(reels)
+    winnings   = int(bet * multiplier)
+
+    console.print(f"\n  [bold white][ {'  '.join(reels)} ][/]")
+
+    if winnings > 0:
+        api.pay_winnings(player_id, winnings)
+        profit = winnings - bet
+        if multiplier >= 10:
+            console.print(Panel(
+                f"[bold green]JACKPOT! 🎉  +{profit} CHIP[/]",
+                border_style="green"))
+        else:
+            console.print(f"[green]  Winner! ×{multiplier}  →  +{profit} CHIP[/]")
+    else:
+        console.print(f"[red]  No match. -{bet} CHIP[/]")
+
+    # payout table
+    t = Table(box=box.SIMPLE, show_header=True)
+    t.add_column("Combo",     style="cyan")
+    t.add_column("Pays",      justify="right")
+    for combo, mult in PAYOUTS.items():
+        t.add_row("  ".join(combo), f"×{mult}")
+    t.add_row("🍒 🍒 any", f"×{PARTIAL_CHERRY}")
+    console.print(t)
+
+    return {"played": True, "reels": reels, "multiplier": multiplier,
+            "bet": bet, "winnings": winnings}
+---
+
+# ============================================================
+# games/roulette.py
+# ============================================================
+
+make-file "games/roulette.py" with ---
+import random
+import time
+from rich.console import Console
+from rich.table import Table
+from rich import box
+
+console = Console()
+
+NUMBERS = list(range(0, 37))   # 0-36 European roulette
+REDS    = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
+BLACKS  = set(NUMBERS) - REDS - {0}
+
+BET_TYPES = {
+    "number":  {"desc": "Exact number (0-36)",   "payout": 35},
+    "red":     {"desc": "Red",                   "payout": 1},
+    "black":   {"desc": "Black",                 "payout": 1},
+    "odd":     {"desc": "Odd",                   "payout": 1},
+    "even":    {"desc": "Even (not 0)",          "payout": 1},
+    "low":     {"desc": "Low  (1-18)",           "payout": 1},
+    "high":    {"desc": "High (19-36)",          "payout": 1},
+}
+
+def _color(n: int) -> str:
+    if n == 0:   return "green"
+    if n in REDS: return "red"
+    return "black"
+
+def _check_win(bet_type: str, value, result: int) -> bool:
+    if bet_type == "number": return result == int(value)
+    if bet_type == "red":    return result in REDS
+    if bet_type == "black":  return result in BLACKS
+    if bet_type == "odd":    return result != 0 and result % 2 == 1
+    if bet_type == "even":   return result != 0 and result % 2 == 0
+    if bet_type == "low":    return 1 <= result <= 18
+    if bet_type == "high":   return 19 <= result <= 36
+    return False
+
+def animate_wheel(console: Console):
+    for _ in range(14):
+        n = random.randint(0, 36)
+        col = _color(n)
+        console.print(f"  🎡  [{col} bold]{n:>2}[/]", end="\r")
+        time.sleep(0.08)
+
+def play(player_id: str, bet: int, bet_type: str, value, api) -> dict:
+    chips = api.get_chips(player_id)
+    if chips < bet:
+        console.print(f"[red]Not enough chips! You have {chips} CHIP.[/]")
+        return {"played": False}
+
+    if bet_type not in BET_TYPES:
+        console.print(f"[red]Unknown bet type.[/]")
+        return {"played": False}
+
+    r = api.place_bet(player_id, bet)
+    if "detail" in r:
+        console.print(f"[red]Bet failed: {r['detail']}[/]")
+        return {"played": False}
+
+    console.print("\n[bold yellow]🎡 Spinning the wheel...[/]")
+    animate_wheel(console)
+
+    result  = random.randint(0, 36)
+    color   = _color(result)
+    parity  = "even" if result % 2 == 0 else "odd"
+    col_str = f"[{color} bold]{result}[/]"
+
+    console.print(f"\n  Ball lands on {col_str} ({color}, {parity})")
+
+    won      = _check_win(bet_type, value, result)
+    payout_m = BET_TYPES[bet_type]["payout"]
+    winnings = int(bet * (payout_m + 1)) if won else 0
+
+    if won:
+        api.pay_winnings(player_id, winnings)
+        profit = winnings - bet
+        console.print(f"[green]  You win! +{profit} CHIP[/]")
+    else:
+        console.print(f"[red]  You lose. -{bet} CHIP[/]")
+
+    return {"played": True, "result": result, "won": won,
+            "bet": bet, "winnings": winnings}
+
+def show_bet_types():
+    t = Table("Bet type", "Description", "Payout", box=box.SIMPLE)
+    for k, v in BET_TYPES.items():
+        t.add_row(k, v["desc"], f"×{v['payout']+1}")
+    console.print(t)
+---
+
+# ============================================================
+# games/coinflip.py
+# ============================================================
+
+make-file "games/coinflip.py" with ---
+import random
+import time
+from rich.console import Console
+
+console = Console()
+
+def animate_flip(console: Console):
+    frames = ["🪙 H", "🪙 T", "🪙 H", "🪙 T", "🪙 H", "🪙 T"]
+    for f in frames:
+        console.print(f"  {f}", end="\r")
+        time.sleep(0.12)
+
+def play(player_id: str, bet: int, choice: str, api) -> dict:
+    choice = choice.upper()
+    if choice not in ("H", "T", "HEADS", "TAILS"):
+        console.print("[red]Choose H/Heads or T/Tails.[/]")
+        return {"played": False}
+
+    chips = api.get_chips(player_id)
+    if chips < bet:
+        console.print(f"[red]Not enough chips! You have {chips} CHIP.[/]")
+        return {"played": False}
+
+    r = api.place_bet(player_id, bet)
+    if "detail" in r:
+        console.print(f"[red]Bet failed: {r['detail']}[/]")
+        return {"played": False}
+
+    console.print("\n[bold yellow]🪙 Flipping...[/]")
+    animate_flip(console)
+
+    result   = random.choice(["H", "T"])
+    result_s = "Heads" if result == "H" else "Tails"
+    pick_s   = "Heads" if choice[0] == "H" else "Tails"
+    won      = choice[0] == result
+    winnings = bet * 2 if won else 0
+
+    console.print(f"\n  Coin shows: [bold cyan]{result_s}[/]  (you picked {pick_s})")
+
+    if won:
+        api.pay_winnings(player_id, winnings)
+        console.print(f"[green]  You win! +{bet} CHIP[/]")
+    else:
+        console.print(f"[red]  You lose. -{bet} CHIP[/]")
+
+    return {"played": True, "result": result_s, "won": won,
+            "bet": bet, "winnings": winnings}
+---
+
+# ============================================================
+# games/dice.py
+# ============================================================
+
+make-file "games/dice.py" with ---
+import random
+import time
+from rich.console import Console
+
+console = Console()
+
+DICE_FACES = {1: "⚀", 2: "⚁", 3: "⚂", 4: "⚃", 5: "⚄", 6: "⚅"}
+PAYOUT     = 5   # net payout multiplier on exact hit (6x gross)
+
+def animate_roll(console: Console):
+    for _ in range(10):
+        n = random.randint(1, 6)
+        console.print(f"  {DICE_FACES[n]}  {n}", end="\r")
+        time.sleep(0.09)
+
+def play(player_id: str, bet: int, pick: int, api) -> dict:
+    if pick not in range(1, 7):
+        console.print("[red]Pick a number from 1 to 6.[/]")
+        return {"played": False}
+
+    chips = api.get_chips(player_id)
+    if chips < bet:
+        console.print(f"[red]Not enough chips! You have {chips} CHIP.[/]")
+        return {"played": False}
+
+    r = api.place_bet(player_id, bet)
+    if "detail" in r:
+        console.print(f"[red]Bet failed: {r['detail']}[/]")
+        return {"played": False}
+
+    console.print(f"\n[bold yellow]🎲 Rolling... (you picked {DICE_FACES[pick]} {pick})[/]")
+    animate_roll(console)
+
+    result   = random.randint(1, 6)
+    won      = result == pick
+    winnings = bet * (PAYOUT + 1) if won else 0
+
+    console.print(f"\n  Dice shows: [bold cyan]{DICE_FACES[result]} {result}[/]")
+
+    if won:
+        api.pay_winnings(player_id, winnings)
+        profit = winnings - bet
+        console.print(f"[green]  Exact hit! +{profit} CHIP  (×{PAYOUT+1})[/]")
+    else:
+        console.print(f"[red]  No match. -{bet} CHIP[/]")
+
+    return {"played": True, "result": result, "won": won,
+            "bet": bet, "winnings": winnings}
+---
+
+# ============================================================
+# casino.py  — main game loop
+# ============================================================
+
+make-file "casino.py" with ---
+"""
+MintCore Casino — CLI
+Requires: MintCore API running on http://127.0.0.1:8000
+
+Usage:
+    python casino.py
+    python casino.py --player myname
+"""
+import sys
+import argparse
+from rich.console import Console
+from rich.panel   import Panel
+from rich.table   import Table
+from rich.prompt  import Prompt, IntPrompt
+from rich         import box
+import httpx
+
+import api as mc
+from config import CURRENCY, WELCOME_BONUS
+from games import slots, roulette, coinflip, dice
+
+console = Console()
+
+# ── Startup ───────────────────────────────────────────────────
+
+def check_api():
+    try:
+        httpx.get(f"http://127.0.0.1:8000/", timeout=3.0).raise_for_status()
+    except Exception:
+        console.print(Panel(
+            "[red]Cannot reach MintCore API at http://127.0.0.1:8000[/]\n\n"
+            "Start it first:\n"
+            "  [bold]mintcore start[/]  or  [bold]py -m mintcore.cli start[/]",
+            title="API Offline", border_style="red"))
+        sys.exit(1)
+
+def setup_player(player_id: str) -> int:
+    mc.ensure_user(player_id)
+    mc.ensure_currency()
+    chips = mc.get_chips(player_id)
+    if chips == 0:
+        console.print(f"[cyan]Welcome bonus: +{WELCOME_BONUS} CHIP[/]")
+        mc.mint_welcome(player_id, WELCOME_BONUS)
+        chips = WELCOME_BONUS
+    return chips
+
+# ── UI helpers ────────────────────────────────────────────────
+
+def show_banner():
+    console.print(Panel(
+        "[bold yellow]🎰  MintCore Casino  🎰[/]\n"
+        "[dim]Powered by MintCore virtual currency engine[/]",
+        border_style="yellow", expand=False))
+
+def show_balance(player_id: str):
+    chips = mc.get_chips(player_id)
+    console.print(f"\n  [bold]Balance:[/] [yellow]{chips:,} CHIP[/]\n")
+    return chips
+
+def show_menu():
+    t = Table(box=box.SIMPLE, show_header=False)
+    t.add_row("[cyan]1[/]", "🎰  Slots")
+    t.add_row("[cyan]2[/]", "🎡  Roulette")
+    t.add_row("[cyan]3[/]", "🪙  Coin Flip")
+    t.add_row("[cyan]4[/]", "🎲  Dice Roll")
+    t.add_row("[cyan]5[/]", "📒  View ledger")
+    t.add_row("[cyan]6[/]", "🚪  Quit")
+    console.print(t)
+
+def get_bet(player_id: str, max_bet: int) -> int | None:
+    chips = mc.get_chips(player_id)
+    if chips <= 0:
+        console.print("[red]You're out of chips! Game over.[/]")
+        return None
+    while True:
+        try:
+            bet = IntPrompt.ask(f"  Bet amount (1–{min(chips, max_bet)})")
+            if 1 <= bet <= min(chips, max_bet):
+                return bet
+            console.print(f"[red]  Enter a value between 1 and {min(chips, max_bet)}[/]")
+        except (ValueError, KeyboardInterrupt):
+            return None
+
+def show_ledger(player_id: str):
+    txs = mc.get_ledger(player_id)
+    if not txs:
+        console.print("  [dim]No transactions yet.[/]")
+        return
+    t = Table("Type", "Amount", "From", "To", "Time", box=box.SIMPLE)
+    for tx in txs[:12]:
+        kind = tx["type"].upper()
+        amt  = str(tx["amount"])
+        frm  = tx["from_user"]
+        to   = tx["to_user"]
+        ts   = str(tx.get("timestamp", ""))[:16]
+        t.add_row(kind, amt, frm, to, ts)
+    console.print(t)
+
+# ── Game dispatchers ──────────────────────────────────────────
+
+def play_slots(player_id: str):
+    console.print("\n[bold]🎰 Slots[/]  — match symbols to win")
+    bet = get_bet(player_id, 500)
+    if bet is None: return
+    slots.play(player_id, bet, mc)
+
+def play_roulette(player_id: str):
+    console.print("\n[bold]🎡 Roulette[/]  — bet on where the ball lands")
+    roulette.show_bet_types()
+    bet_type = Prompt.ask("  Bet type", choices=list(roulette.BET_TYPES.keys()))
+    value    = None
+    if bet_type == "number":
+        value = IntPrompt.ask("  Pick a number (0-36)")
+        if not (0 <= value <= 36):
+            console.print("[red]Invalid number.[/]")
+            return
+    bet = get_bet(player_id, 1000)
+    if bet is None: return
+    roulette.play(player_id, bet, bet_type, value, mc)
+
+def play_coinflip(player_id: str):
+    console.print("\n[bold]🪙 Coin Flip[/]  — double or nothing")
+    choice = Prompt.ask("  Heads or Tails?", choices=["H", "T", "Heads", "Tails"])
+    bet    = get_bet(player_id, 2000)
+    if bet is None: return
+    coinflip.play(player_id, bet, choice, mc)
+
+def play_dice(player_id: str):
+    console.print("\n[bold]🎲 Dice Roll[/]  — pick 1-6, hit it for ×6")
+    pick = IntPrompt.ask("  Your number (1-6)")
+    if pick not in range(1, 7):
+        console.print("[red]Pick between 1 and 6.[/]")
+        return
+    bet = get_bet(player_id, 500)
+    if bet is None: return
+    dice.play(player_id, bet, pick, mc)
+
+# ── Main loop ─────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="MintCore Casino")
+    parser.add_argument("--player", default=None, help="Player ID")
+    args = parser.parse_args()
+
+    check_api()
+    show_banner()
+
+    player_id = args.player or Prompt.ask("  [cyan]Enter your player name[/]")
+    chips     = setup_player(player_id)
+
+    console.print(f"\n  Welcome, [bold cyan]{player_id}[/]! You have [yellow]{chips:,} CHIP[/].")
+
+    ACTIONS = {
+        "1": play_slots,
+        "2": play_roulette,
+        "3": play_coinflip,
+        "4": play_dice,
+    }
+
+    while True:
+        show_balance(player_id)
+        show_menu()
+
+        choice = Prompt.ask("  Choose", choices=["1","2","3","4","5","6"])
+
+        if choice == "6":
+            final = mc.get_chips(player_id)
+            console.print(f"\n  Thanks for playing, [bold]{player_id}[/]!")
+            console.print(f"  Final balance: [yellow]{final:,} CHIP[/]")
+            break
+        elif choice == "5":
+            show_ledger(player_id)
+        elif choice in ACTIONS:
+            ACTIONS[choice](player_id)
+
+        chips = mc.get_chips(player_id)
+        if chips <= 0:
+            console.print(Panel(
+                "[red bold]💸 You're broke![/]\n\n"
+                "Come back tomorrow for another welcome bonus.",
+                border_style="red"))
+            break
+
+if __name__ == "__main__":
+    main()
+---
+
+# ============================================================
+# README.md
+# ============================================================
+
+make-file "README.md" with ---
+# MintCore Casino
+
+A CLI casino powered by the MintCore virtual currency engine.
+
+## Requirements
+
+- MintCore API running (`mintcore start` or `py -m mintcore.cli start`)
+- Python 3.10+
+
+## Install & run
+
+```bash
+pip install -r requirements.txt
+python casino.py
+python casino.py --player yourname
+```
+
+## Games
+
+| Game      | Win condition         | Max payout |
+|-----------|-----------------------|------------|
+| 🎰 Slots  | Match 3 symbols       | ×50 (💎💎💎) |
+| 🎡 Roulette | Bet on number/color | ×36 (exact number) |
+| 🪙 Coin Flip | Pick heads/tails  | ×2 |
+| 🎲 Dice Roll | Pick exact number | ×6 |
+
+## How it works
+
+All bets and winnings flow through the MintCore API as real
+currency transfers — so everything is recorded in the ledger.
+New players receive a 100 CHIP welcome bonus on first launch.
+---
+
+print ""
+print "MintCore Casino scaffold complete!"
+print ""
+print "  1. Start MintCore API:  mintcore start"
+print "  2. cd mintcore-casino"
+print "  3. pip install -r requirements.txt"
+print "  4. python casino.py"
+print ""
